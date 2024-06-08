@@ -82,7 +82,7 @@ static void srv_list_append(const boost::json::value& srv_node) {
     if (srv_obj.contains("http_version")) {
         srv_conf.http_version = srv_obj.at("http_version").as_int64();
     }
-    if (srv_conf.http_version != 1 || srv_conf.http_version != 2) {
+    if (srv_conf.http_version != 1 && srv_conf.http_version != 2) {
         throw std::runtime_error("Invalid http version");
     }
     listen_list_append(srv_conf, srv_obj.at("listen"));
