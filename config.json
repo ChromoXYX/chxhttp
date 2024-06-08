@@ -1,0 +1,4 @@
+{
+    "server": [],
+    "include": "conf.d/*.json"
+}

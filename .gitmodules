@@ -1,0 +1,6 @@
+[submodule "chxnet"]
+	path = chxnet
+	url = https://github.com/ChromoXYX/chxnet.git
+[submodule "chxlog"]
+	path = chxlog
+	url = https://github.com/ChromoXYX/chxlog.git
