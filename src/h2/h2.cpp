@@ -46,10 +46,8 @@ class h2_session {
         file.openat(info.root, req->path.begin(), {.resolve = RESOLVE_IN_ROOT},
                     e);
         if (e) [[unlikely]] {
-            log_norm_h2(*req, oper.stream(),
-                        http::status_code::Internal_Server_Error);
-            return response_5xx(oper, strm_id,
-                                http::status_code::Internal_Server_Error);
+            log_norm_h2(*req, oper.stream(), http::status_code::Forbidden);
+            return response_4xx(oper, strm_id, http::status_code::Forbidden);
         }
         struct stat64 st = {};
         if (fstat64(file.native_handler(), &st) != 0) [[unlikely]] {

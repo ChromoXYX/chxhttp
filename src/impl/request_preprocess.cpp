@@ -3,8 +3,8 @@
 #include "../wildcard.hpp"
 
 template <typename Conn>
-static net::future<> ignite(session& ses, http::request_type& req,
-                            http::response_type<Conn> resp) {
+static net::future<bool> ignite(session& ses, http::request_type& req,
+                                http::response_type<Conn> resp) {
     if (req.fields.exactly_contains("Connection", "close")) {
         ses.shutdown_recv(resp.conn());
         ses.connection_close = true;
@@ -23,33 +23,34 @@ static net::future<> ignite(session& ses, http::request_type& req,
                 log_norm_resp(req, resp.stream(), http::status_code::Forbidden);
                 if (!ses.connection_close) {
                     ses.reset_timer(3s);
-                    co_return resp.end(ses.forbidden_raw);
+                    resp.end(ses.forbidden_raw);
                 } else {
-                    co_return resp.end(ses.forbidden_close,
-                                       resp.deferred_shutdown());
+                    resp.end(ses.forbidden_close, resp.deferred_shutdown());
                 }
+                co_return false;
             }
         } else {
             log_norm_resp(req, resp.stream(), http::status_code::Forbidden);
             if (!ses.connection_close) {
                 ses.reset_timer(3s);
-                co_return resp.end(ses.forbidden_raw);
+                resp.end(ses.forbidden_raw);
             } else {
-                co_return resp.end(ses.forbidden_close,
-                                   resp.deferred_shutdown());
+                resp.end(ses.forbidden_close, resp.deferred_shutdown());
             }
+            co_return false;
         }
     }
+    co_return true;
 }
 
 auto request_preprocess(session& ses, http::request_type& req,
                         http::response_type<session::norm_conn_type> resp)
-    -> net::future<> {
+    -> net::future<bool> {
     return ignite(ses, req, resp);
 }
 
 auto request_preprocess(session& ses, http::request_type& req,
                         http::response_type<session::ssl_conn_type> resp)
-    -> net::future<> {
+    -> net::future<bool> {
     return ignite(ses, req, resp);
 }

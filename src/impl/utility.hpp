@@ -2,10 +2,10 @@
 
 #include "../session.hpp"
 
-net::future<>
+net::future<bool>
 request_preprocess(session& ses, http::request_type& req,
                    http::response_type<session::norm_conn_type> resp);
-net::future<>
+net::future<bool>
 request_preprocess(session& ses, http::request_type& req,
                    http::response_type<session::ssl_conn_type> resp);
 

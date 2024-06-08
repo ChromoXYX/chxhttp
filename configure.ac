@@ -37,6 +37,13 @@ PKG_CHECK_MODULES([llhttp], [libllhttp], [
 ], [
     AC_MSG_ERROR(["llhttp not found"])
 ])
+PKG_CHECK_MODULES([nghttp2], [libnghttp2], [
+    CHXHTTP_CXXFLAGS="$CHXHTTP_CXXFLAGS $nghttp2_CFLAGS"
+    CHXHTTP_LDADD="$CHXHTTP_LDADD \
+        $__CHXHTTP_START_STATIC $nghttp2_LIBS $__CHXHTTP_END_STATIC"
+], [
+    AC_MSG_ERROR(["nghttp2 not found"])
+])
 PKG_CHECK_MODULES([openssl], [openssl], [
     CHXHTTP_CXXFLAGS="$CHXHTTP_CXXFLAGS $openssl_CFLAGS"
     CHXHTTP_LDADD="$CHXHTTP_LDADD $openssl_LIBS"
