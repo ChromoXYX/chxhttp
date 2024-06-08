@@ -43,26 +43,10 @@ PKG_CHECK_MODULES([openssl], [openssl], [
 ], [
     AC_MSG_ERROR(["openssl not found"])
 ])
-# PKG_CHECK_MODULES([sol2], [sol2], [
-#     CHXHTTP_CXXFLAGS="$CHXHTTP_CXXFLAGS $sol2_CFLAGS"
-#     CHXHTTP_LDADD="$CHXHTTP_LDADD \
-#         $__CHXHTTP_START_STATIC $sol2_LIBS $__CHXHTTP_END_STATIC"
-# ], [
-#     AC_MSG_ERROR(["sol2 not found"])
-# ])
-# PKG_CHECK_MODULES([luajit], [luajit], [
-#     CHXHTTP_CXXFLAGS="$CHXHTTP_CXXFLAGS $luajit_CFLAGS"
-#     CHXHTTP_LDADD="$CHXHTTP_LDADD \
-#         $__CHXHTTP_START_STATIC $luajit_LIBS $__CHXHTTP_END_STATIC"
-# ], [
-#     AC_MSG_ERROR(["luajit not found"])
-# ])
 
 AX_BOOST_BASE([1.75.0], [
     AX_BOOST_JSON
     AX_BOOST_PROGRAM_OPTIONS
-dnl    AC_SUBST(CHXHTTP_LDADD, ["$CHXHTTP_LDADD \
-dnl        $BOOST_JSON_LIB $BOOST_PROGRAM_OPTIONS_LIB"])
     CHXHTTP_CXXFLAGS="$CHXHTTP_CXXFLAGS $BOOST_CXXFLAGS"
     CHXHTTP_LDFLAGS="$CHXHTTP_LDFLAGS $BOOST_LDFLAGS"
     CHXHTTP_LDADD="$CHXHTTP_LDADD $__CHXHTTP_START_STATIC \
@@ -71,40 +55,6 @@ dnl        $BOOST_JSON_LIB $BOOST_PROGRAM_OPTIONS_LIB"])
 ], [
     AC_MSG_ERROR([boost not found])
 ])
-
-# AC_ARG_WITH([backtrace], [
-#     AS_HELP_STRING([--with-backtrace], [location of libbacktrace])
-# ], [
-#     AC_MSG_CHECKING([libbacktrace])
-#     AS_IF([test 'x$withval' != xyes], [
-#         AS_IF([test -f "$withval/include/backtrace.h"], [], [
-#             AC_MSG_ERROR(["cannot find include/backtrace.h in $withval"])
-#         ])
-#         AS_IF([test -f "$withval/lib/libbacktrace.a"], [], [
-#             AC_MSG_ERROR(["cannot find lib/libbacktrace.a in $withval"])
-#         ])
-#         CHXHTTP_CXXFLAGS="$CHXHTTP_CXXFLAGS -I$withval/include"
-#         CHXHTTP_LDADD="$CHXHTTP_LDADD $withval/lib/libbacktrace.a"
-#         AC_MSG_RESULT(["$withval"])
-#     ], [
-#         AC_CHECK_HEADER([backtrace.h], [], [
-#             AC_MSG_ERROR("cannot find backtrace.h in system include dirs")
-#         ])
-#         AC_CHECK_LIB(["backtrace"], ["backtrace_simple"], [], [
-#             AC_MSG_ERROR(["cannot link against libbacktrace, or cannot find function backtrack_simple in the library"])
-#         ])
-#         AC_MSG_RESULT([yes])
-#     ])
-# ], [
-#     AC_MSG_CHECKING([libbacktrace])
-#     AC_CHECK_HEADER([backtrace.h], [], [
-#         AC_MSG_ERROR("cannot find backtrace.h in system include dirs")
-#     ])
-#     AC_CHECK_LIB(["backtrace"], ["backtrace_simple"], [], [
-#         AC_MSG_ERROR(["cannot link against libbacktrace, or cannot find function backtrack_simple in the library"])
-#     ])
-#     AC_MSG_RESULT([yes])
-# ])
 
 AC_PROG_CXX
 AC_CONFIG_FILES([

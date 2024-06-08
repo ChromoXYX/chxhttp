@@ -43,8 +43,8 @@ std::jthread ring::worker([]() {
         auto&& q = ::ring.pop();
         while (!q.empty()) {
             // fwrite(q.front().c_str(), 1, q.front().size(), stderr);
-            write(sink.load(std::memory_order_acquire), q.front().c_str(),
-                  q.front().size());
+            ssize_t r = write(sink.load(std::memory_order_acquire),
+                              q.front().c_str(), q.front().size());
             q.pop();
         }
     }
