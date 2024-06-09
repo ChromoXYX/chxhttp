@@ -1,9 +1,19 @@
 #pragma once
 
 #include "./request.hpp"
-#include "./response.hpp"
+#include "./status_code.hpp"
 #include "./events.hpp"
-#include <iostream>
+#include "./detail/payload.hpp"
+
+#include <chx/log.hpp>
+#include <chx/net.hpp>
+
+namespace chx::http {
+class connection_closed : public net::exception {
+  public:
+    using exception::exception;
+};
+}  // namespace chx::http
 
 namespace chx::http::detail {
 // template <typename T> struct identity {
@@ -28,8 +38,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
     template <typename T>
     using rebind = operation<Stream, Session, /*StreamAccessor,*/ T>;
     struct internal_read {};
-
-    friend struct response_type<operation>;
+    struct internal_write {};
 
     template <typename Str, typename Ses, typename SA>
     operation(Str&& str, Ses&& ses, SA&& sa)
@@ -72,67 +81,164 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
     template <typename Cntl>
     void operator()(Cntl& cntl, const std::error_code& e, std::size_t s,
                     internal_read) {
-        __M_reading = false;
-        if (!e && !should_stop()) {
-            __M_next = __M_inbuf.data();
-            __M_avail = s;
-            exec();
-        } else {
-            __M_should_stop = true;
-            cancel_all();
-            try {
-                on<bad_network>(__M_session, *this, e);
-            } catch (...) {
-                cntl.complete(std::error_code{});
-                std::rethrow_exception(std::current_exception());
+        io_cntl.unset_recving();
+        if (!e || e == net::errc::operation_canceled) {
+            if (io_cntl.want_recv()) {
+                __M_next = __M_inbuf.data();
+                __M_avail = s;
+                feed();
             }
-            cntl.complete(e ? e : net::detail::make_ec(net::errc::timed_out));
+        } else {
+            // network failure
+            terminate_now();
         }
-    }
-
-    template <typename Cntl>
-    void operator()(Cntl& cntl, const std::error_code& e, std::size_t s) {
-        return operator()(cntl, e, s, response_write{});
+        cntl.complete(e);
     }
 
     template <typename Cntl>
     void operator()(Cntl& cntl, const std::error_code& e, std::size_t s,
-                    response_write) {
-        if (!e && !should_stop()) {
-            resume();
-        } else {
-            __M_should_stop = true;
+                    internal_write) {
+        io_cntl.unset_sending();
+        if (io_cntl.goaway_sent()) {
             cancel_all();
-            try {
-                on<bad_network>(__M_session, *this, e);
-            } catch (...) {
-                cntl.complete(std::error_code{});
-                std::rethrow_exception(std::current_exception());
+        }
+        if (!e || e == net::errc::operation_canceled) {
+            do_send();
+            if (io_cntl.goaway_sent()) {
+                io_cntl.shutdown_send();
             }
-            cntl.complete(e ? e : net::detail::make_ec(net::errc::timed_out));
+        } else {
+            // network failure
+            terminate_now();
         }
+        cntl.complete(e);
     }
 
-    void resume() {
-        if (!__M_reading) {
-            exec();
-        }
-    }
-    constexpr void should_stop(bool value) noexcept(true) {
-        if (value) {
-            __M_should_stop = true;
-        }
-    }
-    constexpr bool should_stop() const noexcept(true) {
-        return __M_should_stop;
-    }
-
-    constexpr bool reading() const noexcept(true) { return __M_reading; }
-
-  protected:
+  private:
     Stream __M_nstream;
     Session __M_session;
 
+    std::vector<std::variant<
+        std::tuple<std::string_view, std::string, std::string,
+                   std::string_view>,  // header-only
+        std::tuple<std::string_view, std::string, std::string, std::string_view,
+                   detail::payload_rep,
+                   std::vector<struct net::iovec_buffer>>,  // with payload
+        std::tuple<std::string_view, std::string, std::string, std::string_view,
+                   std::vector<unsigned char>>,
+        std::tuple<std::string_view, std::string, std::string, std::string_view,
+                   std::vector<net::iovec_buffer>>,
+        std::tuple<std::string_view, std::string, std::string, std::string_view,
+                   std::string_view>,
+        std::string_view>>
+        __M_pending_response;
+
+    template <std::size_t Idx, typename... Ts>
+    void __response_emplace(status_code code, const fields_type& fields,
+                            Ts&&... ts) {
+        __M_pending_response.emplace_back(
+            std::in_place_index_t<Idx>{}, std::string_view{"HTTP/1.1 "},
+            chx::log::format(CHXLOG_STR("%u %s\r\n"),
+                             static_cast<unsigned short>(code),
+                             status_code_name(code)),
+            fields.to_string(), std::string_view{"\r\n"},
+            std::forward<Ts>(ts)...);
+    }
+
+    template <typename... Ts>
+    void __response(status_code code, const fields_type& fields, Ts&&... ts) {
+        if constexpr (sizeof...(Ts) > 1) {
+            return __response_multi(code, fields, std::forward<Ts>(ts)...);
+        } else if constexpr (sizeof...(Ts) == 1) {
+            return __response_single(code, fields, std::forward<Ts>(ts)...);
+        } else {
+            return __response0(code, fields);
+        }
+    }
+    void __response0(status_code code, const fields_type& fields) {
+        __response_emplace<0>(code, fields);
+    }
+    template <typename... Ts>
+    void __response_multi(status_code code, const fields_type& fields,
+                          Ts&&... ts) {
+        std::unique_ptr store =
+            detail::payload_store::create(std::forward<Ts>(ts)...);
+        std::vector<net::iovec_buffer> iov =
+            detail::create_iovec_vector(store->data);
+        __response_emplace<1>(code, fields, std::move(store), std::move(iov));
+    }
+    template <typename T>
+    void __response_single(status_code code, const fields_type& fields, T&& t) {
+        if constexpr (std::is_lvalue_reference_v<T>) {
+            return __response_multi(code, fields, std::forward<T>(t));
+        } else {
+            using __dct = std::decay_t<T>;
+            if constexpr (std::is_same_v<__dct, std::vector<unsigned char>>) {
+                __response_emplace<2>(code, fields, std::move(t));
+            } else if constexpr (std::is_same_v<__dct, std::string_view>) {
+                __response_emplace<4>(code, fields, std::move(t));
+            } else if constexpr (std::is_same_v<
+                                     __dct, std::vector<net::iovec_buffer>>) {
+                __response_emplace<3>(code, fields, std::move(t));
+            } else {
+                return __response_multi(code, fields, std::forward<T>(t));
+            }
+        }
+    }
+
+  public:
+    constexpr auto& guard() {
+        if (!io_cntl.goaway_sent()) {
+            return *this;
+        } else {
+            throw connection_closed();
+        }
+    }
+    constexpr bool get_guard() noexcept(true) { return !io_cntl.goaway_sent(); }
+
+    template <typename... Ts>
+    void response(status_code code, const fields_type& fields, Ts&&... ts) {
+        __response(code, fields, std::forward<Ts>(ts)...);
+        if (code == status_code::Bad_Request ||
+            static_cast<unsigned short>(code) >= 500) {
+            io_cntl.send_goaway();
+        }
+        do_send();
+    }
+    void response(status_code code, std::string_view sv) {
+        __M_pending_response.emplace_back(std::in_place_index_t<5>{}, sv);
+        if (code == status_code::Bad_Request ||
+            static_cast<unsigned short>(code) >= 500) {
+            io_cntl.send_goaway();
+        }
+        do_send();
+    }
+
+    constexpr void h11_shutdown_recv() noexcept(true) {
+        io_cntl.shutdown_recv();
+    }
+    constexpr void h11_shutdown_both() noexcept(true) {
+        h11_shutdown_recv();
+        io_cntl.send_goaway();
+    }
+    constexpr bool h11_would_close() noexcept(true) {
+        return !io_cntl.want_recv();
+    }
+    void h11_close_connection() {
+        h11_shutdown_both();
+        if (!io_cntl.is_sending() && __M_pending_response.empty()) {
+            cancel_all();
+        } else {
+            do_send();
+        }
+    }
+
+    void terminate_now() {
+        io_cntl.shutdown_both();
+        cancel_all();
+    }
+
+  private:
     struct settings_t {
         llhttp_settings_t s = {};
 
@@ -222,33 +328,72 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
         enum Why { Waiting, HeadersComplete, MsgComplete, Error } why = Waiting;
         bool want_data = true;
         bool need_exec = true;
-        bool should_close = false;
         std::size_t current_max = 4096;
         ssize_t current_size = 0;
     } __M_parse_state;
     llhttp_t __M_parser;
-    bool __M_should_stop = false;
-    bool __M_reading = false;
+
+    struct {
+        // whether server want to recv or process next frame
+        constexpr bool want_recv() const noexcept(true) { return v & 1; }
+        // whether server CAN send any frame
+        constexpr bool want_send() const noexcept(true) { return v & 2; }
+        // whether is an outstanding send task
+        constexpr bool is_sending() const noexcept(true) { return v & 4; }
+        // whether there is an outstanding recv task
+        constexpr bool is_recving() const noexcept(true) { return v & 8; }
+
+        // to make server unable to process any frame or send any frame
+        constexpr void shutdown_both() noexcept(true) {
+            shutdown_recv();
+            shutdown_send();
+        }
+        constexpr void shutdown_recv() noexcept(true) { v &= ~1; }
+        constexpr void shutdown_send() noexcept(true) { v &= ~2; }
+
+        constexpr void set_sending() noexcept(true) { v |= 4; }
+        constexpr void unset_sending() noexcept(true) { v &= ~4; }
+
+        constexpr void set_recving() noexcept(true) { v |= 8; }
+        constexpr void unset_recving() noexcept(true) { v &= ~8; }
+
+        constexpr void send_goaway() noexcept(true) { v |= 16; }
+        constexpr bool goaway_sent() noexcept(true) { return v & 16; }
+
+      private:
+        char v = 1 | 2;
+    } io_cntl;
+
     void parse_restart() noexcept(true) { __M_parse_state = {}; }
 
     void do_read() {
-        assert(__M_reading == false);
-        __M_reading = true;
-        stream().lowest_layer().async_read_some(
-            net::buffer(__M_inbuf),
-            cntl().template next_with_tag<internal_read>());
+        if (can_read()) {
+            io_cntl.set_recving();
+            stream().lowest_layer().async_read_some(
+                net::buffer(__M_inbuf),
+                cntl().template next_with_tag<internal_read>());
+        }
+    }
+
+    void do_send() {
+        if (can_send()) {
+            io_cntl.set_sending();
+            net::async_write_sequence_exactly(
+                stream(), std::move(__M_pending_response),
+                cntl().template next_with_tag<internal_write>());
+        }
     }
 
     void fatal_close(const std::error_code& e = {}) {
-        __M_should_stop = true;
+        io_cntl.shutdown_both();
         cancel_all();
         cntl().complete(e);
     }
 
     // weak exception guarantee
     // that is, if anything throws, cntl.complete() is guaranteed to be called
-    void exec() {
-        if (!__M_should_stop) {
+    void feed() {
+        if (io_cntl.want_recv()) {
             if (__M_avail ||
                 __M_parse_state.why == __M_parse_state.HeadersComplete) {
                 llhttp_errno r;
@@ -262,57 +407,62 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
                     llhttp_resume(&__M_parser);
                     __M_avail -= llhttp_get_error_pos(&__M_parser) - __M_next;
                     __M_next = llhttp_get_error_pos(&__M_parser);
-                    if (__M_parse_state.why ==
-                        __M_parse_state.HeadersComplete) {
-                        __M_parse_state.want_data = false;
-                        try {
+                    try {
+                        if (__M_parse_state.why ==
+                            __M_parse_state.HeadersComplete) {
+                            __M_parse_state.want_data = false;
                             on<header_complete>(__M_session, __M_request,
-                                                response_type(*this));
-                        } catch (...) {
-                            fatal_close();
-                            std::rethrow_exception(std::current_exception());
-                        }
-                        if (!__M_parse_state.should_close) {
-                            return exec();
+                                                *this);
                         } else {
-                            __M_should_stop = true;
-                            return cntl().complete(std::error_code{});
-                        }
-                    } else {
-                        try {
+                            if (__M_request.fields.exactly_contains(
+                                    "connection", "close")) {
+                                h11_shutdown_recv();
+                            }
                             on<message_complete>(__M_session, __M_request,
-                                                 response_type(*this));
-                        } catch (...) {
-                            fatal_close();
-                            std::rethrow_exception(std::current_exception());
-                        }
-                        if (!__M_parse_state.should_close) {
+                                                 *this);
                             parse_restart();
-                        } else {
-                            __M_should_stop = true;
-                            return cntl().complete(std::error_code{});
                         }
+                    } catch (const std::exception& e) {
+                        struct user_ise {
+                            fields_type fields;
+
+                            user_ise() {
+                                fields.set_field("Server", "chxhttp.h11");
+                                fields.set_field("Connection", "close");
+                            }
+                        } static const ise;
+                        response(status_code::Internal_Server_Error,
+                                 ise.fields);
                     }
+                    do_read();
+                    do_send();
+                    return feed();
                 } else if (r == HPE_OK) {
                     __M_avail = 0;
                     __M_next = nullptr;
-                    return do_read();
                 } else {
-                    __M_should_stop = true;
-                    try {
-                        on<bad_request>(__M_session, response_type(*this));
-                    } catch (...) {
-                        fatal_close();
-                        std::rethrow_exception(std::current_exception());
-                    }
-                    return fatal_close();
+                    struct badrequest {
+                        fields_type fields;
+
+                        badrequest() {
+                            fields.set_field("Server", "chxhttp.h11");
+                            fields.set_field("Connection", "close");
+                        }
+                    } static const ise;
+                    response(status_code::Bad_Request, ise.fields);
                 }
-            } else {
-                return do_read();
             }
-        } else {
-            return cntl().complete(std::error_code{});
+            do_read();
+            do_send();
         }
+    }
+
+    constexpr bool can_read() noexcept(true) {
+        return io_cntl.want_recv() && !io_cntl.is_recving();
+    }
+    constexpr bool can_send() noexcept(true) {
+        return io_cntl.want_send() && !io_cntl.is_sending() &&
+               !__M_pending_response.empty();
     }
 };
 template <typename Stream, typename Session, typename StreamAccessor>

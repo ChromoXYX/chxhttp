@@ -6,28 +6,24 @@
 template <typename Conn>
 void send_byte_range(session& ses, net::file f, std::string_view mime,
                      struct stat64 st, const http::request_type& req,
-                     http::response_type<Conn> resp) {
+                     Conn& conn) {
     std::vector<std::pair<std::size_t, std::size_t>> range;
     http::fields_type h;
     h.add_field("Server", "chxhttp");
     if (!parse_byte_range(req.fields.find("range")->second, range) ||
         range.empty()) {
         h.add_field("Connection", "close");
-        ses.shutdown_recv(resp.conn());
-        log_norm_resp(req, resp.stream(), http::status_code::Bad_Request);
-        return resp.end_without_body(http::status_code::Bad_Request, h,
-                                     resp.deferred_shutdown());
+        log_norm_resp(req, conn.stream(), http::status_code::Bad_Request);
+        return conn.response(http::status_code::Bad_Request, h);
     }
 
     auto [begin, tail] = range.front();
     std::size_t len = tail - begin + 1;
     if (begin + len > st.st_size) {
         h.add_field("Connection", "close");
-        ses.shutdown_recv(resp.conn());
-        log_norm_resp(req, resp.stream(),
+        log_norm_resp(req, conn.stream(),
                       http::status_code::Range_Not_Satisfiable);
-        return resp.end_without_body(http::status_code::Range_Not_Satisfiable,
-                                     h, resp.deferred_shutdown());
+        return conn.response(http::status_code::Range_Not_Satisfiable, h);
     }
 
     net::mapped_file mapped;
@@ -42,29 +38,27 @@ void send_byte_range(session& ses, net::file f, std::string_view mime,
 
     if (e) {
         log_warn_resp(
-            req, resp.stream(),
+            req, conn.stream(),
             chx::log::format("Failed to map file: %s"_str, e.message()));
-        ses.shutdown_recv(resp.conn());
-        return resp.end(ses.ise_raw, resp.deferred_shutdown());
+        return conn.response(http::status_code::Internal_Server_Error,
+                             ses.ise_raw);
     }
 
     h.add_field("Content-Range", chx::log::format("bytes %lu-%lu/%lu"_str,
                                                   begin, tail, st.st_size));
     h.add_field("Content-Length", chx::log::format("%lu"_str, len));
-    log_norm_resp(req, resp.stream(), http::status_code::Partial_Content);
-    if (!ses.connection_close) {
+    log_norm_resp(req, conn.stream(), http::status_code::Partial_Content);
+    if (!conn.h11_would_close()) {
         ses.reset_timer(3s);
         h.add_field("Connection", "keep-alive");
         h.add_field("Keep-Alive", "timeout=3");
-        return resp.end(
+        return conn.response(
             http::status_code::Partial_Content, h,
-            net::carrier{std::move(mapped), begin - true_begin, len},
-            resp.cntl().next());
+            net::carrier{std::move(mapped), begin - true_begin, len});
     } else {
         h.add_field("Connection", "close");
-        return resp.end(
+        return conn.response(
             http::status_code::Partial_Content, h,
-            net::carrier{std::move(mapped), begin - true_begin, len},
-            resp.deferred_shutdown());
+            net::carrier{std::move(mapped), begin - true_begin, len});
     }
 }

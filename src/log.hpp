@@ -4,7 +4,7 @@
 #include <chx/log/chrono.hpp>
 #include <chx/net.hpp>
 #include <chx/http/request.hpp>
-#include <chx/http/response.hpp>
+#include <chx/http/status_code.hpp>
 
 void set_log_sink(int fd) noexcept(true);
 int get_log_sink() noexcept(true);

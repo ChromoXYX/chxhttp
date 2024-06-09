@@ -4,11 +4,11 @@
 
 template <typename Conn>
 static net::future<bool> ignite(session& ses, http::request_type& req,
-                                http::response_type<Conn> resp) {
-    if (req.fields.exactly_contains("Connection", "close")) {
-        ses.shutdown_recv(resp.conn());
-        ses.connection_close = true;
+                                Conn& conn) {
+    if (!conn.get_guard()) {
+        co_return false;
     }
+
     if (!ses.info.conf.server_name.empty()) {
         if (req.fields.contains("host")) {
             const auto& req_host = req.fields.find("host")->second;
@@ -20,22 +20,25 @@ static net::future<bool> ignite(session& ses, http::request_type& req,
                 }
             }
             if (!found) {
-                log_norm_resp(req, resp.stream(), http::status_code::Forbidden);
-                if (!ses.connection_close) {
+                log_norm_resp(req, conn.stream(), http::status_code::Forbidden);
+                if (!conn.h11_would_close()) {
                     ses.reset_timer(3s);
-                    resp.end(ses.forbidden_raw);
+                    conn.response(http::status_code::Forbidden,
+                                  ses.forbidden_raw);
                 } else {
-                    resp.end(ses.forbidden_close, resp.deferred_shutdown());
+                    conn.response(http::status_code::Forbidden,
+                                  ses.forbidden_close);
                 }
                 co_return false;
             }
         } else {
-            log_norm_resp(req, resp.stream(), http::status_code::Forbidden);
-            if (!ses.connection_close) {
+            log_norm_resp(req, conn.stream(), http::status_code::Forbidden);
+            if (!conn.h11_would_close()) {
                 ses.reset_timer(3s);
-                resp.end(ses.forbidden_raw);
+                conn.response(http::status_code::Forbidden, ses.forbidden_raw);
             } else {
-                resp.end(ses.forbidden_close, resp.deferred_shutdown());
+                conn.response(http::status_code::Forbidden,
+                              ses.forbidden_close);
             }
             co_return false;
         }
@@ -44,13 +47,11 @@ static net::future<bool> ignite(session& ses, http::request_type& req,
 }
 
 auto request_preprocess(session& ses, http::request_type& req,
-                        http::response_type<session::norm_conn_type> resp)
-    -> net::future<bool> {
-    return ignite(ses, req, resp);
+                        session::norm_conn_type& conn) -> net::future<bool> {
+    return ignite(ses, req, conn);
 }
 
 auto request_preprocess(session& ses, http::request_type& req,
-                        http::response_type<session::ssl_conn_type> resp)
-    -> net::future<bool> {
-    return ignite(ses, req, resp);
+                        session::ssl_conn_type& conn) -> net::future<bool> {
+    return ignite(ses, req, conn);
 }

@@ -90,7 +90,6 @@ struct session {
     // close     -> deferred_shutdown() takes care of it, and all operations
     //              will be cancelled.
     const info_type& info;
-    bool connection_close = false;
     net::cancellation_signal timer_cncl;
 
     session(const info_type& i) : info(i) {}
@@ -103,20 +102,6 @@ struct session {
         }
     }
 
-    template <typename Conn> static void shutdown_recv(Conn& conn) {
-        if constexpr (http::is_norm_socket<
-                          std::decay_t<decltype(conn.stream())>>::value) {
-            std::error_code e;
-            conn.stream().shutdown(conn.stream().shutdown_receive, e);
-        }
-        conn.should_stop(true);
-    }
-
-    template <typename Conn>
-    void operator()(http::bad_request, http::response_type<Conn> resp) {
-        resp.cntl().cancel_all();
-    }
-
     template <typename Conn>
     void operator()(http::connection_start, Conn& conn) {
         log_info("Connection start with %s\n"_str,
@@ -127,11 +112,10 @@ struct session {
                     timer_cncl,
                     conn.cntl().next_then(
                         [&conn](const std::error_code& e) mutable {
-                            conn.should_stop(true);
+                            conn.h11_close_connection();
                             if (!e) {
                                 log_info(CHXLOG_STR("Session timeout\n"));
                                 std::error_code e;
-                                shutdown_recv(conn);
                             }
                             conn.cntl().complete(e);
                         })));
@@ -139,36 +123,26 @@ struct session {
 
     template <typename Conn>
     void operator()(http::header_complete, http::request_type& req,
-                    http::response_type<Conn> resp) {
+                    Conn& conn) {
         if (req.method != http::method_type::GET) {
-            resp.conn().should_stop(true);
             static const http::fields_type not_implemented_header = {
                 {"Connection", "close"}, {"Content-Length", "22"}};
-            resp.end(http::status_code::Not_Implemented, not_implemented_header,
-                     std::string_view{"<p>not implemented</p>"},
-                     resp.deferred_shutdown());
+            conn.response(http::status_code::Not_Implemented,
+                          not_implemented_header,
+                          std::string_view{"<p>not implemented</p>"});
+            conn.h11_shutdown_both();
         }
-    }
-
-    template <typename Conn> void tear_down(http::response_type<Conn> resp) {
-        resp.conn().should_stop(true);
-        resp.conn().cancel_all();
-        std::error_code e;
-        resp.stream().shutdown(resp.stream().shutdown_both, e);
-    }
-    template <typename Conn, typename... Ts>
-    void resume(http::response_type<Conn> resp, Ts&&... ts) {
-        resp.conn()(resp.cntl(), std::forward<Ts>(ts)...);
     }
 
     template <typename Conn>
     void operator()(http::message_complete, http::request_type& req,
-                    http::response_type<Conn> resp) {
+                    Conn& conn) {
         reset_timer(0s);
-        co_spawn(global_ctx, work(std::move(req), resp),
-                 resp.next_then([resp](const std::error_code& e) mutable {
-                     resp.cntl().complete(e);
-                 }));
+        co_spawn(
+            global_ctx, work(std::move(req), conn),
+            conn.cntl().next_then([&conn](const std::error_code& e) mutable {
+                conn.cntl().complete(e);
+            }));
     }
 
     static constexpr std::string_view not_found_raw =
@@ -214,8 +188,6 @@ struct session {
         "\r\n"
         "<p>Forbidden</p>";
 
-    net::task work(http::request_type req,
-                   http::response_type<norm_conn_type> resp);
-    net::task work(http::request_type req,
-                   http::response_type<ssl_conn_type> resp);
+    net::task work(http::request_type req, norm_conn_type& conn);
+    net::task work(http::request_type req, ssl_conn_type& conn);
 };

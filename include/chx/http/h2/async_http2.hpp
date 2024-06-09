@@ -11,6 +11,7 @@
 #include <numeric>
 #include <set>
 
+#include "../detail/payload.hpp"
 #include "./exception.hpp"
 #include "./types.hpp"
 #include "./frame_type.hpp"
@@ -256,81 +257,29 @@ class h2_impl : HPackImpl {
         HalfClosedLocal,
         // Closed
     };
-    struct payload_store {
-        virtual ~payload_store() = default;
 
-        template <typename... Ts> auto static create(Ts&&... ts) {
-            struct impl : payload_store {
-                impl(impl&&) = default;
-                impl(Ts&&... ts) : data(std::forward<Ts>(ts)...) {}
-
-                std::tuple<std::remove_reference_t<Ts>...> data;
-
-                using data_len =
-                    std::integral_constant<std::size_t, sizeof...(Ts)>;
-            };
-            return std::make_unique<impl>(std::forward<Ts>(ts)...);
-        }
-    };
-    struct payload_rep {
-        payload_rep() = default;
-        payload_rep(payload_rep&&) = default;
-        template <typename T>
-        payload_rep(std::unique_ptr<T> ptr) : payload(ptr.release()) {}
-
-        payload_rep& operator=(payload_rep&&) = default;
-
-        std::unique_ptr<payload_store> payload;
-
-        using value_type = unsigned char;
-        constexpr const value_type* data() const noexcept(true) {
-            return nullptr;
-        }
-        constexpr std::size_t size() const noexcept(true) { return 0; }
-    };
-    template <typename... Ts>
-    static std::vector<net::iovec_buffer>
-    create_iovec_vector(std::tuple<Ts...>& tp) {
-        std::vector<net::iovec_buffer> _r;
-        _r.reserve(sizeof...(Ts));
-        std::apply(
-            [&](const auto&... item) {
-                (..., _r.emplace_back(net::buffer(item)));
-            },
-            tp);
-        return std::move(_r);
-    }
-    template <typename... Ts>
-    static std::vector<net::iovec_buffer> create_iovec_vector_ts(Ts&&... ts) {
-        std::vector<net::iovec_buffer> _r;
-        _r.reserve(sizeof...(Ts));
-        (..., _r.emplace_back(net::buffer(ts)));
-        return std::move(_r);
-    }
-    struct payload_monostate {
-        using value_type = unsigned char;
-        constexpr unsigned char* data() noexcept(true) { return nullptr; }
-        constexpr std::size_t size() const noexcept(true) { return 0; }
-    };
+    using payload_rep = http::detail::payload_rep;
+    using payload_store = http::detail::payload_store;
+    using payload_monostate = http::detail::payload_monostate;
     using payload_variant =
         std::variant<std::tuple<payload_rep, std::vector<net::iovec_buffer>>,
                      std::vector<unsigned char>, payload_monostate>;
     using pending_frame_type =
         std::tuple<std::array<unsigned char, 9>, payload_variant>;
     template <typename T>
-    static constexpr auto&
+    static auto&
     __pending_frame_type_emplace_back(std::vector<pending_frame_type>& v,
                                       std::array<unsigned char, 9>&& header,
                                       std::unique_ptr<T> store) {
         std::tuple<payload_rep, std::vector<net::iovec_buffer>> tp(
-            payload_rep{}, create_iovec_vector(store->data));
+            payload_rep{}, http::detail::create_iovec_vector(store->data));
         std::get<0>(tp).payload.reset(store.release());
         return v.emplace_back(
             std::move(header),
             payload_variant(std::in_place_index_t<0>{}, std::move(tp)));
     }
 
-    static constexpr auto&
+    static auto&
     __pending_frame_type_emplace_back(std::vector<pending_frame_type>& v,
                                       std::array<unsigned char, 9>&& header,
                                       payload_rep rep,
@@ -339,7 +288,7 @@ class h2_impl : HPackImpl {
                               payload_variant(std::in_place_index_t<0>{},
                                               std::move(rep), std::move(iov)));
     }
-    static constexpr auto&
+    static auto&
     __pending_frame_type_emplace_back(std::vector<pending_frame_type>& v,
                                       std::array<unsigned char, 9>&& header,
                                       std::vector<unsigned char>&& iov) {
@@ -347,7 +296,7 @@ class h2_impl : HPackImpl {
             std::move(header),
             payload_variant(std::in_place_index_t<1>{}, std::move(iov)));
     }
-    static constexpr auto&
+    static auto&
     __pending_frame_type_emplace_back(std::vector<pending_frame_type>& v,
                                       std::array<unsigned char, 9>&& header) {
         return v.emplace_back(std::move(header),
@@ -1147,7 +1096,6 @@ class h2_impl : HPackImpl {
         create_GOAWAY_frame(ec, std::forward<Ts>(ts)...);
         do_send();
     }
-    template <typename... Ts> void h2_shutdown_both() { terminate_now(); }
 
     void create_HEADER_frame(flags_type flags, stream_id_type strm_id,
                              const fields_type& fields) {
@@ -1174,7 +1122,7 @@ class h2_impl : HPackImpl {
         } else {
             auto store = payload_store::create(std::move(payload));
             std::vector<net::iovec_buffer> iovec =
-                create_iovec_vector(store->data);
+                http::detail::create_iovec_vector(store->data);
             std::vector<net::iovec_buffer> section =
                 iovec_generator(iovec, conn_settings.max_frame_size);
             pending_frames_emplace_back(
@@ -1199,9 +1147,9 @@ class h2_impl : HPackImpl {
                 .payload.reset(store.release());
         }
         if (flags & frame_type::END_STREAM) {
-            return send_ES_lifecycle(ite);
+            send_ES_lifecycle(ite);
         }
-        return;
+        do_send();
     }
 
     template <typename... Ts>
@@ -1227,7 +1175,7 @@ class h2_impl : HPackImpl {
                 strm.server_window -= total_size;
                 if (total_size <= conn_settings.max_frame_size) {
                     auto store = payload_store::create(std::forward<Ts>(ts)...);
-                    auto iovec = create_iovec_vector(store->data);
+                    auto iovec = http::detail::create_iovec_vector(store->data);
                     auto header_arr = create_frame_header_helper(
                         FrameType::DATA, total_size, flags, strm_id);
                     pending_frames_emplace_back(std::move(header_arr),
@@ -1236,7 +1184,7 @@ class h2_impl : HPackImpl {
                 } else {
                     auto store = payload_store::create(std::forward<Ts>(ts)...);
                     std::vector<net::iovec_buffer> iovec =
-                        create_iovec_vector(store->data);
+                        http::detail::create_iovec_vector(store->data);
                     while (!iovec.empty()) {
                         std::size_t n = 0;
                         std::vector<net::iovec_buffer> section =
@@ -1258,13 +1206,12 @@ class h2_impl : HPackImpl {
                 }
                 if (flags & frame_type::END_STREAM) {
                     send_ES_lifecycle(ite);
-                    return;
                 }
             } else {
                 // total_size > min_window
                 assert(min_window >= 0);
                 auto store = payload_store::create(std::forward<Ts>(ts)...);
-                auto iovec = create_iovec_vector(store->data);
+                auto iovec = http::detail::create_iovec_vector(store->data);
                 __M_strms_seek_for_window.insert(strm_id);
                 if (min_window <= conn_settings.max_frame_size) {
                     server_conn_window -= min_window;
@@ -1310,7 +1257,7 @@ class h2_impl : HPackImpl {
             pending_frames_emplace_back(
                 create_frame_header_helper(FrameType::DATA, 0, flags, strm_id));
         }
-        return;
+        do_send();
     }
 
     void create_RST_STREAM_frame(stream_id_type strm_id, ErrorCodes ec) {
@@ -1322,8 +1269,8 @@ class h2_impl : HPackImpl {
                                            strm_id),
                 std::move(payload));
             __M_strms.erase(ite);
-            return;
         }
+        do_send();
     }
 
     void create_SETTINGS_frame(
@@ -1345,12 +1292,12 @@ class h2_impl : HPackImpl {
             std::move(payload));
         watchdog_settings_ack_deadline = std::chrono::system_clock::now() +
                                          settings_frame_detail.ack_timeout;
-        return;
+        do_send();
     }
     void create_SETTINGS_ACK_frame() {
         pending_frames_emplace_back(create_frame_header_helper(
             FrameType::SETTINGS, 0, frame_type::ACK, 0));
-        return;
+        do_send();
     }
 
     void create_PING_frame(std::vector<unsigned char> data) {
@@ -1361,13 +1308,13 @@ class h2_impl : HPackImpl {
         pending_frames_emplace_back(
             create_frame_header_helper(FrameType::PING, 8, 0, 0),
             std::move(data));
-        return;
+        do_send();
     }
     void create_PING_ACK_frame(std::vector<unsigned char>&& data) {
         pending_frames_emplace_back(
             create_frame_header_helper(FrameType::PING, 8, frame_type::ACK, 0),
             std::move(data));
-        return;
+        do_send();
     }
 
     // chxhttp always tries to make sure window size is fixed
@@ -1391,7 +1338,7 @@ class h2_impl : HPackImpl {
             std::move(payload));
         client_conn_window += inc;
         strm.client_window += inc;
-        return;
+        do_send();
     }
 
   private:
@@ -1433,7 +1380,7 @@ class h2_impl : HPackImpl {
                 std::move(payload));
         }
         io_cntl.send_goaway();
-        return;
+        do_send();
     }
 
     void create_DATA_flush(decltype(__M_strms)::iterator strm_ite) {
@@ -1479,6 +1426,7 @@ class h2_impl : HPackImpl {
                 if (flags & frame_type::END_STREAM) {
                     strm.pending_DATA_frames.clear();
                     send_ES_lifecycle(strm_ite);
+                    do_send();
                     return;
                 }
             } else {
@@ -1522,7 +1470,7 @@ class h2_impl : HPackImpl {
         } else {
             __M_strms_seek_for_window.erase(strm_ite->first);
         }
-        return;
+        do_send();
     }
 
     constexpr static std::size_t
