@@ -379,7 +379,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
         if (can_send()) {
             io_cntl.set_sending();
             net::async_write_sequence_exactly(
-                stream(), std::move(__M_pending_response),
+                stream().lowest_layer(), std::move(__M_pending_response),
                 cntl().template next_with_tag<internal_write>());
         }
     }
