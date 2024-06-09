@@ -84,7 +84,7 @@ class h2_session {
     template <typename Cntl>
     net::task cowork(Cntl& cntl, h2::stream_id_type strm_id,
                      std::shared_ptr<request_type> req) {
-        if (!cntl.get_guard()) [[unlikely]] {
+        if (!cntl.h2_stream_ready_for_response(strm_id)) [[unlikely]] {
             co_return;
         }
 

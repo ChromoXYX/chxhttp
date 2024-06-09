@@ -1094,6 +1094,19 @@ class h2_impl : HPackImpl {
         }
     }
     constexpr bool get_guard() noexcept(true) { return !io_cntl.goaway_sent(); }
+    constexpr bool
+    h2_stream_ready_for_response(stream_id_type strm_id) noexcept(true) {
+        if (!get_guard()) [[unlikely]] {
+            return false;
+        }
+        if (auto ite = __M_strms.find(strm_id); ite != __M_strms.end()) {
+            h2_stream& strm = ite->second;
+            return strm.template state_any_of<StreamStates::Open,
+                                              StreamStates::HalfClosedRemote>();
+        } else {
+            return false;
+        }
+    }
 
     template <typename... Ts> void h2_shutdown_recv(ErrorCodes ec, Ts&&... ts) {
         create_GOAWAY_frame(ec, std::forward<Ts>(ts)...);
