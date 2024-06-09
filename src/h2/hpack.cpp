@@ -59,8 +59,8 @@ void hpack_nghttp2::decode(const unsigned char* begin, std::size_t len,
         begin += rv;
         len -= rv;
         if (inflate_flags & NGHTTP2_HD_INFLATE_EMIT) {
-            fields.emplace(std::string{(const char*)nv.name, nv.namelen},
-                           std::string{(const char*)nv.value, nv.valuelen});
+            fields.add_field(std::string{(const char*)nv.name, nv.namelen},
+                             std::string{(const char*)nv.value, nv.valuelen});
         }
         if (inflate_flags & NGHTTP2_HD_INFLATE_FINAL) {
             nghttp2_hd_inflate_end_headers(__M_inflater);
@@ -101,8 +101,8 @@ void hpack_nghttp2::decode_block(const unsigned char* in, std::size_t inlen,
         in += rv;
         inlen -= rv;
         if (inflate_flags & NGHTTP2_HD_INFLATE_EMIT) {
-            fields.emplace(std::string{(const char*)nv.name, nv.namelen},
-                           std::string{(const char*)nv.value, nv.valuelen});
+            fields.add_field(std::string{(const char*)nv.name, nv.namelen},
+                             std::string{(const char*)nv.value, nv.valuelen});
         }
         if (inflate_flags & NGHTTP2_HD_INFLATE_FINAL) {
             if (!final) [[unlikely]] {

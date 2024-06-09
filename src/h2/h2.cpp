@@ -7,6 +7,7 @@
 #include "../log.hpp"
 #include "./h2_log.hpp"
 #include "../http_related/mime.hpp"
+#include "../http_related/etag.hpp"
 
 #include <chx/http/h2/async_http2.hpp>
 #include <chx/net/file.hpp>
@@ -19,6 +20,7 @@ namespace h2 = http::h2;
 namespace log = chx::log;
 
 using namespace std::literals;
+using namespace log::literals;
 
 class h2_session {
   public:
@@ -31,48 +33,117 @@ class h2_session {
 
     h2_session(const info_type& i) : info(i) {}
 
-    template <typename Oper>
-    void work(Oper& oper, h2::stream_id_type strm_id,
-              std::shared_ptr<request_type> req) {
-        if (req->method != http::method_type::GET) [[unlikely]] {
-            log_norm_h2(*req, oper.stream(),
-                        http::status_code::Not_Implemented);
-            return response_5xx(oper, strm_id,
-                                http::status_code::Not_Implemented);
+    template <typename Cntl>
+    net::future<>
+    cowork_sendfile(Cntl& cntl, net::file f, h2::stream_id_type strm_id,
+                    std::string_view mime, const struct stat64& st,
+                    std::shared_ptr<request_type> req) {
+        if (!cntl.get_guard()) {
+            co_return;
+        }
+
+        std::error_code e;
+        std::size_t s = 0;
+
+        h2::fields_type h;
+        h.set_field("Server", "chxhttp.h2");
+        h.set_field("Content-Length", log::format("%lu"_str, st.st_size));
+        h.set_field("Content-Type", mime);
+        log_norm_h2(*req, cntl.stream(), http::status_code::OK);
+        if (st.st_size <= 2 * 1024 * 1024) {
+            std::vector<unsigned char> buf(st.st_size);
+            std::tie(e, s) = co_await f.async_read_some(
+                net::buffer(buf),
+                cntl.cntl().next_then(net::as_tuple(net::use_coro)));
+            if (!cntl.get_guard()) {
+                co_return;
+            }
+            if (!e) {
+                co_return response_2xx(cntl, strm_id, http::status_code::OK,
+                                       mime, std::move(buf));
+            } else {
+                co_return response_5xx(
+                    cntl, strm_id, http::status_code::Internal_Server_Error);
+            }
+        } else {
+            net::mapped_file mapped;
+            mapped.map(f, st.st_size, PROT_READ, MAP_SHARED, 0, e);
+            if (!e) {
+                co_return response_2xx(cntl, strm_id, http::status_code::OK,
+                                       mime, std::move(mapped));
+            } else {
+                log_warn_h2(
+                    *req, cntl.stream(),
+                    log::format("Failed to map file: %s"_str, e.message()));
+                co_return response_5xx(
+                    cntl, strm_id, http::status_code::Internal_Server_Error);
+            }
+        }
+    }
+
+    template <typename Cntl>
+    net::task cowork(Cntl& cntl, h2::stream_id_type strm_id,
+                     std::shared_ptr<request_type> req) {
+        if (!cntl.get_guard()) [[unlikely]] {
+            co_return;
         }
 
         std::error_code e;
         net::file file(global_ctx);
         file.openat(info.root, req->path.begin(), {.resolve = RESOLVE_IN_ROOT},
                     e);
-        if (e) [[unlikely]] {
-            log_norm_h2(*req, oper.stream(), http::status_code::Forbidden);
-            return response_4xx(oper, strm_id, http::status_code::Forbidden);
+        if (!e) {
+            struct stat64 st = {};
+            if (fstat64(file.native_handler(), &st) != 0) {
+                log_warn_h2(
+                    *req, cntl.stream(),
+                    log::format("fstat64 failed: %s\n"_str, strerror(errno)));
+                co_return response_5xx(
+                    cntl, strm_id, http::status_code::Internal_Server_Error);
+            }
+            if (S_ISREG(st.st_mode)) {
+                co_return co_await cowork_sendfile(
+                    cntl, std::move(file), strm_id,
+                    query_mime(
+                        std::filesystem::path(req->path).extension().c_str()),
+                    st, req);
+            } else {
+                log_norm_h2(*req, cntl.stream(), http::status_code::Forbidden);
+                co_return response_4xx(cntl, strm_id,
+                                       http::status_code::Forbidden);
+            }
+        } else {
+            if (e == net::errc::no_such_file_or_directory) {
+                log_norm_h2(*req, cntl.stream(), http::status_code::Not_Found);
+                co_return response_4xx(cntl, strm_id,
+                                       http::status_code::Not_Found);
+            } else if (e == net::errc::cross_device_link) {
+                log_norm_h2(*req, cntl.stream(), http::status_code::Forbidden);
+                co_return response_4xx(cntl, strm_id,
+                                       http::status_code::Forbidden);
+            } else {
+                log_norm_h2(*req, cntl.stream(),
+                            http::status_code::Internal_Server_Error);
+                co_return response_5xx(
+                    cntl, strm_id, http::status_code::Internal_Server_Error);
+            }
         }
-        struct stat64 st = {};
-        if (fstat64(file.native_handler(), &st) != 0) [[unlikely]] {
-            log_norm_h2(*req, oper.stream(),
-                        http::status_code::Internal_Server_Error);
-            return response_5xx(oper, strm_id,
-                                http::status_code::Internal_Server_Error);
+    }
+
+    template <typename Cntl>
+    void work(Cntl& cntl, h2::stream_id_type strm_id,
+              std::shared_ptr<request_type> req) {
+        if (req->method != http::method_type::GET) [[unlikely]] {
+            log_norm_h2(*req, cntl.stream(),
+                        http::status_code::Not_Implemented);
+            return response_5xx(cntl, strm_id,
+                                http::status_code::Not_Implemented);
         }
-        if (S_ISDIR(st.st_mode)) [[unlikely]] {
-            log_norm_h2(*req, oper.stream(), http::status_code::Forbidden);
-            return response_4xx(oper, strm_id, http::status_code::Forbidden);
-        }
-        net::mapped_file mapped;
-        mapped.map(file, st.st_size, PROT_READ, MAP_SHARED, 0, e);
-        if (e) [[unlikely]] {
-            log_norm_h2(*req, oper.stream(),
-                        http::status_code::Internal_Server_Error);
-            return response_5xx(oper, strm_id,
-                                http::status_code::Internal_Server_Error);
-        }
-        log_norm_h2(*req, oper.stream(), http::status_code::OK);
-        return response_2xx(
-            oper, strm_id, http::status_code::OK,
-            query_mime(std::filesystem::path(req->path).extension().c_str()),
-            std::move(mapped));
+
+        co_spawn(global_ctx, cowork(cntl, strm_id, req),
+                 cntl.cntl().next_then([&cntl](const std::error_code& e) {
+                     cntl.cntl().complete(e);
+                 }));
     }
 
     template <typename Cntl>
@@ -187,39 +258,45 @@ class h2_session {
                              http::status_code code, std::string_view mime,
                              Ts&&... ts) {
         h2::fields_type fields;
-        fields.emplace(":status", log::format(CHXLOG_STR("%u"),
-                                              static_cast<unsigned int>(code)));
-        fields.emplace("server", "chxhttp.h2");
+        fields.set_field(
+            ":status",
+            log::format(CHXLOG_STR("%u"), static_cast<unsigned int>(code)));
+        fields.set_field("server", "chxhttp.h2");
         if constexpr (sizeof...(Ts)) {
-            fields.emplace(
+            fields.set_field(
                 "content-length",
                 log::format(CHXLOG_STR("%lu"), (... + net::buffer(ts).size())));
-            fields.emplace("content-type", mime);
+            fields.set_field("content-type", mime);
         }
         cntl.create_HEADER_frame(h2::frame_type::NO_FLAG, strm_id, fields);
         cntl.create_DATA_frame(h2::frame_type::END_STREAM, strm_id,
                                std::forward<Ts>(ts)...);
+        cntl.do_send();
     }
 
     template <typename Cntl>
     static void response_4xx(Cntl& cntl, h2::stream_id_type strm_id,
                              http::status_code code) {
         h2::fields_type fields;
-        fields.emplace(":status", log::format(CHXLOG_STR("%u"),
-                                              static_cast<unsigned int>(code)));
-        fields.emplace("server", "chxhttp.h2");
+        fields.set_field(
+            ":status",
+            log::format(CHXLOG_STR("%u"), static_cast<unsigned int>(code)));
+        fields.set_field("server", "chxhttp.h2");
         cntl.create_HEADER_frame(h2::frame_type::END_STREAM, strm_id, fields);
         cntl.create_RST_STREAM_frame(strm_id, h2::ErrorCodes::NO_ERROR);
+        cntl.do_send();
     }
 
     template <typename Cntl>
     static void response_5xx(Cntl& cntl, h2::stream_id_type strm_id,
                              http::status_code sc) {
         h2::fields_type fields;
-        fields.emplace(":status", log::format(CHXLOG_STR("%u"),
-                                              static_cast<unsigned int>(sc)));
-        fields.emplace("server", "chxhttp.h2");
+        fields.set_field(":status", log::format(CHXLOG_STR("%u"),
+                                                static_cast<unsigned int>(sc)));
+        fields.set_field("server", "chxhttp.h2");
         cntl.create_HEADER_frame(h2::frame_type::END_STREAM, strm_id, fields);
+        cntl.h2_shutdown_recv(h2::ErrorCodes::INTERNAL_ERROR);
+        cntl.do_send();
     }
 
     bool ignore_DATA_frame(const stream_userdata_type& strm) noexcept(true) {

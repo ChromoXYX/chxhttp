@@ -183,6 +183,15 @@ class h2_impl : HPackImpl {
         cntl.complete(e);
     }
 
+    void do_send() {
+        if (can_send()) {
+            io_cntl.set_sending();
+            net::async_write_sequence_exactly(
+                stream().lowest_layer(), std::move(pending_frames),
+                cntl().template next_with_tag<ev_send>());
+        }
+    }
+
   protected:
     Stream __M_stream;
     FixedTimerRef& __M_fixed_timer;
@@ -226,14 +235,7 @@ class h2_impl : HPackImpl {
       private:
         char v = 1 | 2;
     } io_cntl;
-    void do_send() {
-        if (can_send()) {
-            io_cntl.set_sending();
-            net::async_write_sequence_exactly(
-                stream().lowest_layer(), std::move(pending_frames),
-                cntl().template next_with_tag<ev_send>());
-        }
-    }
+
     void do_read() {
         if (can_read()) {
             io_cntl.set_recving();
@@ -1091,6 +1093,7 @@ class h2_impl : HPackImpl {
             throw connection_closed();
         }
     }
+    constexpr bool get_guard() noexcept(true) { return !io_cntl.goaway_sent(); }
 
     template <typename... Ts> void h2_shutdown_recv(ErrorCodes ec, Ts&&... ts) {
         create_GOAWAY_frame(ec, std::forward<Ts>(ts)...);
@@ -1149,7 +1152,7 @@ class h2_impl : HPackImpl {
         if (flags & frame_type::END_STREAM) {
             send_ES_lifecycle(ite);
         }
-        do_send();
+        // do_send();
     }
 
     template <typename... Ts>
@@ -1166,7 +1169,7 @@ class h2_impl : HPackImpl {
         }
         std::size_t total_size = 0;
         if constexpr (sizeof...(Ts)) {
-            total_size = (... + buffer(ts).size());
+            total_size = (... + net::buffer(ts).size());
         }
         if (total_size != 0) {
             int min_window = std::min(server_conn_window, strm.server_window);
@@ -1257,7 +1260,7 @@ class h2_impl : HPackImpl {
             pending_frames_emplace_back(
                 create_frame_header_helper(FrameType::DATA, 0, flags, strm_id));
         }
-        do_send();
+        // do_send();
     }
 
     void create_RST_STREAM_frame(stream_id_type strm_id, ErrorCodes ec) {
@@ -1270,7 +1273,7 @@ class h2_impl : HPackImpl {
                 std::move(payload));
             __M_strms.erase(ite);
         }
-        do_send();
+        // do_send();
     }
 
     void create_SETTINGS_frame(
@@ -1292,12 +1295,7 @@ class h2_impl : HPackImpl {
             std::move(payload));
         watchdog_settings_ack_deadline = std::chrono::system_clock::now() +
                                          settings_frame_detail.ack_timeout;
-        do_send();
-    }
-    void create_SETTINGS_ACK_frame() {
-        pending_frames_emplace_back(create_frame_header_helper(
-            FrameType::SETTINGS, 0, frame_type::ACK, 0));
-        do_send();
+        // do_send();
     }
 
     void create_PING_frame(std::vector<unsigned char> data) {
@@ -1308,13 +1306,21 @@ class h2_impl : HPackImpl {
         pending_frames_emplace_back(
             create_frame_header_helper(FrameType::PING, 8, 0, 0),
             std::move(data));
-        do_send();
+        // do_send();
     }
+
+  private:
+    void create_SETTINGS_ACK_frame() {
+        pending_frames_emplace_back(create_frame_header_helper(
+            FrameType::SETTINGS, 0, frame_type::ACK, 0));
+        // do_send();
+    }
+
     void create_PING_ACK_frame(std::vector<unsigned char>&& data) {
         pending_frames_emplace_back(
             create_frame_header_helper(FrameType::PING, 8, frame_type::ACK, 0),
             std::move(data));
-        do_send();
+        // do_send();
     }
 
     // chxhttp always tries to make sure window size is fixed
@@ -1338,10 +1344,9 @@ class h2_impl : HPackImpl {
             std::move(payload));
         client_conn_window += inc;
         strm.client_window += inc;
-        do_send();
+        // do_send();
     }
 
-  private:
     // GOAWAY means shutdown_both for chxhttp, and for now
     template <typename... Ts>
     void create_GOAWAY_frame(ErrorCodes e,
@@ -1426,7 +1431,7 @@ class h2_impl : HPackImpl {
                 if (flags & frame_type::END_STREAM) {
                     strm.pending_DATA_frames.clear();
                     send_ES_lifecycle(strm_ite);
-                    do_send();
+                    // do_send();
                     return;
                 }
             } else {
@@ -1470,7 +1475,7 @@ class h2_impl : HPackImpl {
         } else {
             __M_strms_seek_for_window.erase(strm_ite->first);
         }
-        do_send();
+        // do_send();
     }
 
     constexpr static std::size_t
