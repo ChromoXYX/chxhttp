@@ -22,7 +22,7 @@ static net::future<bool> ignite(session& ses, http::request_type& req,
             if (!found) {
                 log_norm_resp(req, conn.stream(), http::status_code::Forbidden);
                 if (!conn.h11_would_close()) {
-                    ses.reset_timer(3s);
+                    ses.reset_keepalive_timer(3s);
                     conn.response(http::status_code::Forbidden,
                                   ses.forbidden_raw);
                 } else {
@@ -34,7 +34,7 @@ static net::future<bool> ignite(session& ses, http::request_type& req,
         } else {
             log_norm_resp(req, conn.stream(), http::status_code::Forbidden);
             if (!conn.h11_would_close()) {
-                ses.reset_timer(3s);
+                ses.reset_keepalive_timer(3s);
                 conn.response(http::status_code::Forbidden, ses.forbidden_raw);
             } else {
                 conn.response(http::status_code::Forbidden,

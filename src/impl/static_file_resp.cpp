@@ -45,7 +45,7 @@ static net::future<> ignite(session& ses, net::file f, std::string_view mime,
             }
             if (!e) {
                 if (!conn.h11_would_close()) {
-                    ses.reset_timer(3s);
+                    ses.reset_keepalive_timer(3s);
                 }
                 co_return conn.response(http::status_code::OK, h,
                                         std::move(buf));
@@ -60,7 +60,7 @@ static net::future<> ignite(session& ses, net::file f, std::string_view mime,
             mapped.map(f, st.st_size, PROT_READ, MAP_SHARED, 0, e);
             if (!e) {
                 if (!conn.h11_would_close()) {
-                    ses.reset_timer(3s);
+                    ses.reset_keepalive_timer(3s);
                 }
                 co_return conn.response(http::status_code::OK, h,
                                         std::move(mapped));
@@ -86,7 +86,7 @@ static net::future<> ignite(session& ses, net::file f, std::string_view mime,
         header.add_field("ETag", std::move(et));
         log_norm_resp(req, conn.stream(), http::status_code::Not_Modified);
         if (!conn.h11_would_close()) {
-            ses.reset_timer(3s);
+            ses.reset_keepalive_timer(3s);
         }
         co_return conn.response(http::status_code::Not_Modified, header);
     }

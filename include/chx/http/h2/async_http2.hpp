@@ -37,6 +37,7 @@ class h2_impl : HPackImpl {
     using Flags = http::h2::frame_type::Flags;
 
     struct ev_send {};
+    struct ev_send_final {};
     struct ev_recv {};
     struct ev_preface {};
     struct ev_ack_timeout {};
@@ -108,6 +109,8 @@ class h2_impl : HPackImpl {
                         cntl.complete(std::error_code{});
                         std::rethrow_exception(std::current_exception());
                     }
+                    do_read();
+                    do_send();
                 }
                 return cntl.complete(e);
             } else {
@@ -132,16 +135,27 @@ class h2_impl : HPackImpl {
     void operator()(cntl_type& cntl, const std::error_code& e, std::size_t s,
                     ev_send) {
         io_cntl.unset_sending();
-        if (io_cntl.goaway_sent()) {
-            cancel_all();
-        }
-        if (!e || e == net::errc::operation_canceled) {
-            do_send();
-            if (io_cntl.goaway_sent()) {
-                io_cntl.shutdown_send();
+        if (!e) {
+            if (!io_cntl.goaway_sent()) {
+                do_send();
+            } else {
+                cancel_all();
+                if (can_send()) {
+                    io_cntl.set_sending();
+                    net::async_write_sequence_exactly(
+                        stream().lowest_layer(), std::move(pending_frames),
+                        cntl.template next_with_tag<ev_send_final>());
+                }
             }
         } else {
-            // network failure
+            terminate_now();
+        }
+        cntl.complete(e);
+    }
+    void operator()(cntl_type& cntl, const std::error_code& e, std::size_t s,
+                    ev_send_final) {
+        io_cntl.unset_sending();
+        if (e) {
             terminate_now();
         }
         cntl.complete(e);
@@ -159,6 +173,8 @@ class h2_impl : HPackImpl {
                 cntl.complete(std::error_code{});
                 std::rethrow_exception(std::current_exception());
             }
+            do_read();
+            do_send();
         } else {
             // network failure
             terminate_now();
@@ -521,8 +537,6 @@ class h2_impl : HPackImpl {
             }
             }
         }
-        do_read();
-        do_send();
     }
 
     void terminate_now(const std::error_code& ec) {

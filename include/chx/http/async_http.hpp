@@ -39,6 +39,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
     using rebind = operation<Stream, Session, /*StreamAccessor,*/ T>;
     struct internal_read {};
     struct internal_write {};
+    struct internal_write_final {};
 
     template <typename Str, typename Ses, typename SA>
     operation(Str&& str, Ses&& ses, SA&& sa)
@@ -87,6 +88,8 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
                 __M_next = __M_inbuf.data();
                 __M_avail = s;
                 feed();
+                do_read();
+                do_send();
             }
         } else {
             // network failure
@@ -99,16 +102,31 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
     void operator()(Cntl& cntl, const std::error_code& e, std::size_t s,
                     internal_write) {
         io_cntl.unset_sending();
-        if (io_cntl.goaway_sent()) {
-            cancel_all();
-        }
-        if (!e || e == net::errc::operation_canceled) {
-            do_send();
-            if (io_cntl.goaway_sent()) {
-                io_cntl.shutdown_send();
+        // internal_write would never get cancelled, except for terminate_now()
+        if (!e) {
+            if (!io_cntl.goaway_sent()) {
+                do_send();
+            } else {
+                cancel_all();
+                if (can_send()) {
+                    io_cntl.set_sending();
+                    net::async_write_sequence_exactly(
+                        stream().lowest_layer(),
+                        std::move(__M_pending_response),
+                        cntl.template next_with_tag<internal_write_final>());
+                }
             }
         } else {
-            // network failure
+            terminate_now();
+        }
+        cntl.complete(e);
+    }
+
+    template <typename Cntl>
+    void operator()(Cntl& cntl, const std::error_code& e, std::size_t s,
+                    internal_write_final) {
+        io_cntl.unset_sending();
+        if (e) {
             terminate_now();
         }
         cntl.complete(e);
@@ -169,14 +187,15 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
     }
     template <typename T>
     void __response_single(status_code code, const fields_type& fields, T&& t) {
-        if constexpr (std::is_lvalue_reference_v<T>) {
+        if constexpr (std::is_lvalue_reference_v<T> &&
+                      !std::is_same_v<std::decay_t<T>, std::string_view>) {
             return __response_multi(code, fields, std::forward<T>(t));
         } else {
             using __dct = std::decay_t<T>;
             if constexpr (std::is_same_v<__dct, std::vector<unsigned char>>) {
                 __response_emplace<2>(code, fields, std::move(t));
             } else if constexpr (std::is_same_v<__dct, std::string_view>) {
-                __response_emplace<4>(code, fields, std::move(t));
+                __response_emplace<4>(code, fields, t);
             } else if constexpr (std::is_same_v<
                                      __dct, std::vector<net::iovec_buffer>>) {
                 __response_emplace<3>(code, fields, std::move(t));
@@ -214,6 +233,8 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
         do_send();
     }
 
+    // h11_shutdown_recv and h11_shutdown_both shall not be invoked out of
+    // async_combine::operator() scope!
     constexpr void h11_shutdown_recv() noexcept(true) {
         io_cntl.shutdown_recv();
     }
@@ -221,6 +242,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
         h11_shutdown_recv();
         io_cntl.send_goaway();
     }
+
     constexpr bool h11_would_close() noexcept(true) {
         return !io_cntl.want_recv();
     }
@@ -384,12 +406,6 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
         }
     }
 
-    void fatal_close(const std::error_code& e = {}) {
-        io_cntl.shutdown_both();
-        cancel_all();
-        cntl().complete(e);
-    }
-
     // weak exception guarantee
     // that is, if anything throws, cntl.complete() is guaranteed to be called
     void feed() {
@@ -400,7 +416,6 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
                 try {
                     r = llhttp_execute(&__M_parser, __M_next, __M_avail);
                 } catch (...) {
-                    fatal_close();
                     std::rethrow_exception(std::current_exception());
                 }
                 if (r == HPE_PAUSED) {
@@ -434,9 +449,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
                         response(status_code::Internal_Server_Error,
                                  ise.fields);
                     }
-                    do_read();
-                    do_send();
-                    return feed();
+                    feed();
                 } else if (r == HPE_OK) {
                     __M_avail = 0;
                     __M_next = nullptr;
@@ -452,8 +465,6 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
                     response(status_code::Bad_Request, ise.fields);
                 }
             }
-            do_read();
-            do_send();
         }
     }
 

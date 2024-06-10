@@ -21,43 +21,47 @@ struct session {
         const info_type& info;
 
         struct handshake {};
-        struct handshake_timeout {};
+        struct handshake_ddl {};
         struct http_ {};
 
         template <typename CntlType> using rebind = ssl_operation;
 
         ssl_operation(const info_type& i, net::ssl::context& ssl_ctx,
                       net::ip::tcp::socket&& sock)
-            : info(i), stream(ssl_ctx, std::move(sock)) {
-            // stream.set_option(SOL_TCP, TCP_ULP, "tls");
-        }
+            : info(i), stream(ssl_ctx, std::move(sock)) {}
 
         net::ssl::stream<net::ip::tcp::socket> stream;
-        net::cancellation_signal cncl_cgnl;
+        net::cancellation_signal ssl_handshake_ddl_cncl;
 
         template <typename Cntl> void operator()(Cntl& cntl) {
+            stream.async_do_handshake(cntl.template next_with_tag<handshake>());
             global_timer.async_register(
                 3s, bind_cancellation_signal(
-                        cncl_cgnl,
-                        cntl.template next_with_tag<handshake_timeout>()));
-            stream.async_do_handshake(cntl.template next_with_tag<handshake>());
+                        ssl_handshake_ddl_cncl,
+                        cntl.template next_with_tag<handshake_ddl>()));
         }
 
         template <typename Cntl>
         void operator()(Cntl& cntl, const std::error_code& e, handshake) {
-            cncl_cgnl.emit();
-            if (!e) {
-                http::async_http(stream, session(info),
-                                 cntl.template next_with_tag<http_>());
+            if (ssl_handshake_ddl_cncl) {
+                ssl_handshake_ddl_cncl.emit();
+                ssl_handshake_ddl_cncl.clear();
+                if (!e) {
+                    http::async_http(stream, session(info),
+                                     cntl.template next_with_tag<http_>());
+                }
             }
             cntl.complete(e);
         }
 
         template <typename Cntl>
-        void operator()(Cntl& cntl, const std::error_code& e,
-                        handshake_timeout) {
-            if (!e) {
-                stream.cancel();
+        void operator()(Cntl& cntl, const std::error_code& e, handshake_ddl) {
+            if (ssl_handshake_ddl_cncl) {
+                ssl_handshake_ddl_cncl.clear();
+                if (e == net::errc::operation_canceled) {
+                } else if (!e) {
+                    log_warn("SSL_handshake timeout\n"_str);
+                }
             }
             cntl.complete(e);
         }
@@ -90,35 +94,32 @@ struct session {
     // close     -> deferred_shutdown() takes care of it, and all operations
     //              will be cancelled.
     const info_type& info;
-    net::cancellation_signal timer_cncl;
+    net::cancellation_signal keepalive_ddl_cncl;
 
     session(const info_type& i) : info(i) {}
-
-    template <typename Rep, typename Period>
-    void reset_timer(const std::chrono::duration<Rep, Period>& dur) {
-        auto* h = net::fixed_timer_controller(global_timer, timer_cncl);
-        if (h && h->valid()) {
-            h->update(dur);
-        }
-    }
 
     template <typename Conn>
     void operator()(http::connection_start, Conn& conn) {
         log_info("Connection start with %s\n"_str,
                  get_remote_address(conn.stream()));
-
         global_timer.async_register(
             3s, bind_cancellation_signal(
-                    timer_cncl,
-                    conn.cntl().next_then(
-                        [&conn](const std::error_code& e) mutable {
+                    keepalive_ddl_cncl,
+                    conn.cntl().template next_then(
+                        [&conn](const std::error_code& e) {
                             conn.h11_close_connection();
                             if (!e) {
-                                log_info(CHXLOG_STR("Session timeout\n"));
-                                std::error_code e;
+                                log_info("Session timeout\n"_str);
                             }
                             conn.cntl().complete(e);
                         })));
+    }
+
+    template <typename Rep, typename Per>
+    void reset_keepalive_timer(const std::chrono::duration<Rep, Per>& dur) {
+        auto* cncl =
+            net::safe_fixed_timer_controller(global_timer, keepalive_ddl_cncl);
+        cncl->update(dur);
     }
 
     template <typename Conn>
@@ -137,7 +138,7 @@ struct session {
     template <typename Conn>
     void operator()(http::message_complete, http::request_type& req,
                     Conn& conn) {
-        reset_timer(0s);
+        reset_keepalive_timer(0s);
         co_spawn(
             global_ctx, work(std::move(req), conn),
             conn.cntl().next_then([&conn](const std::error_code& e) mutable {

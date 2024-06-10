@@ -49,7 +49,7 @@ void send_byte_range(session& ses, net::file f, std::string_view mime,
     h.add_field("Content-Length", chx::log::format("%lu"_str, len));
     log_norm_resp(req, conn.stream(), http::status_code::Partial_Content);
     if (!conn.h11_would_close()) {
-        ses.reset_timer(3s);
+        ses.reset_keepalive_timer(3s);
         h.add_field("Connection", "keep-alive");
         h.add_field("Keep-Alive", "timeout=3");
         return conn.response(

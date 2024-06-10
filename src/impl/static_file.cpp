@@ -66,7 +66,7 @@ static net::future<> ignite(session& ses, http::request_type& req, Conn& conn) {
                     log_norm_resp(req, conn.stream(),
                                   http::status_code::Forbidden);
                     if (!conn.h11_would_close()) {
-                        ses.reset_timer(3s);
+                        ses.reset_keepalive_timer(3s);
                         co_return conn.response(http::status_code::Forbidden,
                                                 ses.forbidden_raw);
                     } else {
@@ -78,7 +78,7 @@ static net::future<> ignite(session& ses, http::request_type& req, Conn& conn) {
                 // index.html not found
                 log_norm_resp(req, conn.stream(), http::status_code::Not_Found);
                 if (!conn.h11_would_close()) {
-                    ses.reset_timer(3s);
+                    ses.reset_keepalive_timer(3s);
                     co_return conn.response(http::status_code::Forbidden,
                                             ses.forbidden_raw);
                 } else {
@@ -90,7 +90,7 @@ static net::future<> ignite(session& ses, http::request_type& req, Conn& conn) {
             // target is neither a file or dir
             log_norm_resp(req, conn.stream(), http::status_code::Forbidden);
             if (!conn.h11_would_close()) {
-                ses.reset_timer(3s);
+                ses.reset_keepalive_timer(3s);
                 co_return conn.response(http::status_code::Forbidden,
                                         ses.forbidden_raw);
             } else {
@@ -103,7 +103,7 @@ static net::future<> ignite(session& ses, http::request_type& req, Conn& conn) {
         if (e == net::errc::no_such_file_or_directory) {
             log_norm_resp(req, conn.stream(), http::status_code::Not_Found);
             if (!conn.h11_would_close()) {
-                ses.reset_timer(3s);
+                ses.reset_keepalive_timer(3s);
                 co_return conn.response(http::status_code::Not_Found,
                                         ses.not_found_close);
             } else {
@@ -113,7 +113,7 @@ static net::future<> ignite(session& ses, http::request_type& req, Conn& conn) {
         } else if (e == net::errc::cross_device_link) {
             log_norm_resp(req, conn.stream(), http::status_code::Forbidden);
             if (!conn.h11_would_close()) {
-                ses.reset_timer(3s);
+                ses.reset_keepalive_timer(3s);
                 co_return conn.response(http::status_code::Forbidden,
                                         ses.forbidden_raw);
             } else {
