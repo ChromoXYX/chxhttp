@@ -1591,8 +1591,5 @@ decltype(auto) async_http2(Stream&& stream, std::unique_ptr<Session> session,
 
 /*
 TODO:
-  0. exception instead of ErrorCodes!
-  -1. specify types for strm_id and flags.
-  -2. use htons for endian.
-  3. code review.
+1. remove payload vector of frame later
 */

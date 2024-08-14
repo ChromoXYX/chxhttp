@@ -41,15 +41,6 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
     struct internal_write {};
     struct internal_write_final {};
 
-    template <typename Str, typename Ses, typename SA>
-    operation(Str&& str, Ses&& ses, SA&& sa)
-        : __M_nstream(std::forward<Str>(str)),
-          __M_session(std::forward<Ses>(ses))
-    /*, StreamAccessor(std::forward<SA>(sa))*/ {
-        __M_inbuf.resize(4096);
-        llhttp_init(&__M_parser, HTTP_REQUEST, &settings.s);
-        __M_parser.data = this;
-    }
     template <typename Str, typename Ses>
     operation(Str&& str, Ses&& ses)
         : __M_nstream(std::forward<Str>(str)),
@@ -75,7 +66,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
     void cancel_all() { cntl()(nullptr); }
 
     template <typename Cntl> void operator()(Cntl& cntl) {
-        on<connection_start>(__M_session, *this);
+        on<connection_start>(session(), *this);
         do_read();
     }
 
@@ -324,7 +315,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
 
             s.on_message_begin = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                on<message_begin>(self->__M_session, *self);
+                on<message_begin>(self->session(), *self);
                 return HPE_OK;
             };
             s.on_headers_complete = [](llhttp_t* c) -> int {
@@ -426,14 +417,14 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
                         if (__M_parse_state.why ==
                             __M_parse_state.HeadersComplete) {
                             __M_parse_state.want_data = false;
-                            on<header_complete>(__M_session, __M_request,
+                            on<header_complete>(session(), __M_request,
                                                 *this);
                         } else {
                             if (__M_request.fields.exactly_contains(
                                     "connection", "close")) {
                                 h11_shutdown_recv();
                             }
-                            on<message_complete>(__M_session, __M_request,
+                            on<message_complete>(session(), __M_request,
                                                  *this);
                             parse_restart();
                         }
