@@ -164,6 +164,7 @@ class h2_impl : HPackImpl {
                     ev_recv) {
         io_cntl.unset_recving();
         if (!e || e == net::errc::operation_canceled) {
+            printf("read %lu\n", s);
             try {
                 feed2(__M_inbuf.data(), __M_inbuf.data() + s);
             } catch (const runtime_exception& ex) {
@@ -253,7 +254,9 @@ class h2_impl : HPackImpl {
     } io_cntl;
 
     void do_read() {
+        printf("go to read\n");
         if (can_read()) {
+            printf("start read\n");
             io_cntl.set_recving();
             stream().lowest_layer().async_read_some(
                 net::buffer(__M_inbuf),
@@ -266,6 +269,15 @@ class h2_impl : HPackImpl {
     std::vector<unsigned char> __M_inbuf;
 
     http::h2::frame_type frame_parse;
+    enum class DataFrameStatus : std::uint8_t {
+        DATA_PAD,
+        DATA_BODY,
+        DATA_TAIL
+    };
+    struct {
+        std::uint8_t padded_length = 0;
+        DataFrameStatus status = DataFrameStatus::DATA_PAD;
+    } data_fsm;
     enum class StreamStates : int {
         Idle,
         ReservedLocal,
@@ -464,18 +476,18 @@ class h2_impl : HPackImpl {
                     frame_check_before_payload(frame_parse);
                     // reserve
                     if (frame_parse.length != 0) {
-                        if (frame_parse.type == FrameType::DATA) {
-                            auto ite = __M_strms.find(frame_parse.stream_id);
-                            if (ite != __M_strms.end() &&
-                                !session().ignore_DATA_frame(ite->second)) {
-                                frame_parse.payload.reserve(frame_parse.length);
-                            }
-                        } else {
+                        if (frame_parse.type != FrameType::DATA) {
                             frame_parse.payload.reserve(frame_parse.length);
                         }
                     } else {
                         // process frame...
-                        process_frame();
+                        if (frame_parse.type != FrameType::DATA) {
+                            process_frame();
+                        } else {
+                            const unsigned char* old = ptr;
+                            feed_data(frame_parse, ptr, end);
+                            assert(ptr == old);
+                        }
                         frame_parse.clear();
                         __pstatus = __Start;
                     }
@@ -487,14 +499,15 @@ class h2_impl : HPackImpl {
                 }
             }
             case __FrameHeader: {
-                if (end - ptr >=
-                    frame_parse.length - frame_parse.payload_length) {
+                if (frame_parse.type == FrameType::DATA) {
+                    feed_data(frame_parse, ptr, end);
+                } else if (end - ptr >=
+                           frame_parse.length - frame_parse.payload_length) {
                     std::size_t old = frame_parse.payload_length;
                     frame_parse.payload_length = frame_parse.length;
                     if (frame_parse.type == FrameType::DATA) {
                         if (auto ite = __M_strms.find(frame_parse.stream_id);
-                            ite != __M_strms.end() &&
-                            !session().ignore_DATA_frame(ite->second)) {
+                            ite != __M_strms.end()) {
                             assert(old == frame_parse.payload.size());
                             frame_parse.payload.resize(frame_parse.length);
                             std::copy_n(ptr, frame_parse.length - old,
@@ -539,6 +552,104 @@ class h2_impl : HPackImpl {
         }
     }
 
+    void feed_data(frame_type& frame, const unsigned char*& ptr,
+                   const unsigned char* end) {
+        const unsigned char* tail =
+            ptr + std::min(frame.length - frame.payload_length,
+                           static_cast<unsigned int>(end - ptr));
+        auto ite = __M_strms.find(frame.stream_id);
+        if (ite == __M_strms.end()) {
+            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
+        }
+        h2_stream& strm = ite->second;
+        if (!(frame.flags & frame.PADDED)) {
+            const std::size_t consumed = tail - ptr;
+            assert(frame.payload_length + consumed <= frame.length);
+            on(*this, frame.stream_id, strm, data_frame_block{}, ptr, tail);
+            ptr = tail;
+            frame.payload_length += consumed;
+            if (frame.length == frame.payload_length) {
+                if (frame.flags & Flags::END_STREAM) {
+                    // open -> half-closed remote or half-closed local to closed
+                    // same as HEADER frame, chxhttp would never send ES on open
+                    assert(strm.state == StreamStates::Open);
+                    strm.state = StreamStates::HalfClosedRemote;
+                }
+                on(*this, frame.stream_id, strm,
+                   views::data_type(std::move(frame)));
+                frame.clear();
+
+                __pstatus = __Start;
+                data_fsm.status = DataFrameStatus::DATA_PAD;
+            }
+        } else {
+            while (ptr < tail) {
+                switch (data_fsm.status) {
+                case DataFrameStatus::DATA_PAD: {
+                    assert(frame.payload_length == 0);
+                    const std::uint8_t padded_length = *(ptr++);
+                    if (padded_length + 1 > frame.length ||
+                        padded_length == 0) {
+                        __CHXHTTP_H2RT_THROW(
+                            make_ec(ErrorCodes::PROTOCOL_ERROR));
+                    }
+                    data_fsm.padded_length = padded_length;
+                    ++frame.payload_length;
+                    data_fsm.status = DataFrameStatus::DATA_BODY;
+                    break;
+                }
+                case DataFrameStatus::DATA_BODY: {
+                    const std::size_t body_end =
+                        frame.length - data_fsm.padded_length;
+                    assert(frame.payload_length + data_fsm.padded_length <=
+                           frame.length);
+                    const std::size_t body_remain = frame.length -
+                                                    frame.payload_length -
+                                                    data_fsm.padded_length;
+                    const std::size_t consumed = std::min(
+                        static_cast<std::size_t>(tail - ptr), body_remain);
+                    on(*this, frame.stream_id, strm, data_frame_block{}, ptr,
+                       ptr + consumed);
+
+                    frame.payload_length += consumed;
+                    ptr += consumed;
+                    assert(frame.payload_length <= body_end);
+                    if (frame.payload_length == body_end) {
+                        data_fsm.status = DataFrameStatus::DATA_TAIL;
+                    }
+                    break;
+                }
+                case DataFrameStatus::DATA_TAIL: {
+                    const std::size_t remain_padded =
+                        frame.length - frame.payload_length;
+                    const std::size_t consumed = std::min(
+                        static_cast<std::size_t>(tail - ptr), remain_padded);
+
+                    frame.payload_length += consumed;
+                    ptr += consumed;
+
+                    assert(frame.payload_length <= frame.length);
+                    if (frame.length == frame.payload_length) {
+                        assert(ptr == tail);
+                        if (frame.flags & Flags::END_STREAM) {
+                            assert(strm.state == StreamStates::Open);
+                            strm.state = StreamStates::HalfClosedRemote;
+                        }
+
+                        on(*this, frame.stream_id, strm,
+                           views::data_type(std::move(frame)));
+                        frame.clear();
+
+                        data_fsm.status = DataFrameStatus::DATA_PAD;
+                        __pstatus = __Start;
+                    }
+                    break;
+                }
+                }
+            }
+        }
+    }
+
     void terminate_now(const std::error_code& ec) {
         terminate_now(static_cast<ErrorCodes>(ec.value()));
     }
@@ -555,28 +666,17 @@ class h2_impl : HPackImpl {
     }
 
     void process_frame() {
-        if (frame_parse.type == FrameType::DATA) {
-            if (auto ite = __M_strms.find(frame_parse.stream_id);
-                ite != __M_strms.end() &&
-                !session().ignore_DATA_frame(ite->second)) {
-                assert(frame_parse.payload_length ==
-                       frame_parse.payload.size());
-            }
-        } else {
-            assert(frame_parse.payload_length == frame_parse.payload.size());
-        }
         if (!can_read()) [[unlikely]] {
             return;
         }
-        if (frame_parse.length != frame_parse.payload.size()) {
+        assert(frame_parse.type != FrameType::DATA);
+        if (frame_parse.length != frame_parse.payload.size() ||
+            frame_parse.length != frame_parse.payload_length) [[unlikely]] {
             __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
         }
         switch (frame_parse.type) {
         case FrameType::CONTINUATION: {
             return process_CONTINUATION();
-        }
-        case FrameType::DATA: {
-            return process_DATA();
         }
         case FrameType::HEADERS: {
             return process_HEADER();
@@ -637,40 +737,6 @@ class h2_impl : HPackImpl {
         }
         // lifecycle, but continuation only has END_HEADERS flag
     }
-    void process_DATA() {
-        // padding check
-        if ((frame_parse.flags & Flags::PADDED) &&
-            (frame_parse.payload[0] + 1 > frame_parse.payload.size()))
-            [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-        }
-        auto ite = __M_strms.find(frame_parse.stream_id);
-        if (ite == __M_strms.end()) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        h2_stream& strm = ite->second;
-        // lifecycle
-        if (frame_parse.flags & Flags::END_STREAM) {
-            switch (strm.state) {
-            case StreamStates::Open: {
-                strm.state = StreamStates::HalfClosedRemote;
-                break;
-            }
-            case StreamStates::HalfClosedRemote: {
-                // strm.state = StreamStates::Closed;
-                __M_strms.erase(ite);
-                break;
-            }
-            default: {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-            }
-            }
-        }
-        // invoke
-        on(*this, ite->first, strm.userdata(),
-           views::data_type(std::move(frame_parse)));
-        return;
-    }
     void process_HEADER() {
         if (headers_frame_header_check(frame_parse) != ErrorCodes::NO_ERROR)
             [[unlikely]] {
@@ -706,25 +772,17 @@ class h2_impl : HPackImpl {
             }
         } else {
             h2_stream& strm = ite->second;
-            // es only
+            // life cycle
             if (frame_parse.flags & Flags::END_STREAM) {
+                // open -> half-closed remote, or half-closed local to closed
+                // stream should never be half-closed local, because chxhttp
+                // would never send ES on open: every message should be finished
+                // with ES
                 if (!(frame_parse.flags & Flags::END_HEADERS)) {
                     __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
                 }
-                switch (strm.state) {
-                case StreamStates::Open: {
-                    strm.state = StreamStates::HalfClosedRemote;
-                    break;
-                }
-                case StreamStates::HalfClosedRemote: {
-                    assert(frame_parse.flags & Flags::END_HEADERS);
-                    __M_strms.erase(ite);
-                    break;
-                }
-                default: {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-                }
-                }
+                assert(strm.state == StreamStates::Open);
+                strm.state = StreamStates::HalfClosedRemote;
             }
             if (frame_parse.flags & Flags::END_HEADERS) {
                 // invoke header
@@ -761,6 +819,7 @@ class h2_impl : HPackImpl {
                 __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
             }
         }
+        printf("recv settings\n");
 
         create_SETTINGS_ACK_frame();
         // invoke
@@ -794,22 +853,22 @@ class h2_impl : HPackImpl {
         if (inc <= 0) [[unlikely]] {
             __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
         }
-        if (view.stream_id == 0) {
-            safe_window_inc(server_conn_window, inc);
-            for (auto ite = __M_strms_seek_for_window.begin();
-                 server_conn_window &&
-                 ite != __M_strms_seek_for_window.end();) {
-                if (auto strm_ite = __M_strms.find(*(ite++));
-                    strm_ite != __M_strms.end()) {
-                    create_DATA_flush(strm_ite);
-                } else {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-                }
+        auto safe_inc = [](int old, int inc) -> int {
+            std::int64_t new_val = static_cast<std::int64_t>(old) + inc;
+            if (new_val <= std::numeric_limits<std::int32_t>::max()) {
+                return new_val;
+            } else {
+                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FLOW_CONTROL_ERROR));
             }
+        };
+        if (view.stream_id == 0) {
+            server_conn_window = safe_inc(server_conn_window, inc);
+            
         } else {
             auto ite = __M_strms.find(view.stream_id);
             if (ite != __M_strms.end()) {
-                safe_window_inc(ite->second.server_window, inc);
+                h2_stream& strm = ite->second;
+                strm.server_window = safe_inc(strm.server_window, inc);
                 create_DATA_flush(ite);
             }
         }
@@ -873,15 +932,18 @@ class h2_impl : HPackImpl {
                     client_conn_window -= frame.length;
                     strm.client_window -= frame.length;
                 }
+                printf("remain window %d %d\n", client_conn_window,
+                       strm.client_window);
+                if (client_conn_window == 0 || strm.client_window == 0) {
+                }
                 // check prev frame
                 if (!frame_check_before_payload_no_prev(strm)) [[unlikely]] {
                     __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
                 }
                 // check strm state
-                if (strm.template state_any_of<
-                        StreamStates::Open, StreamStates::HalfClosedRemote>()) {
+                if (strm.state == StreamStates::Open) {
                     return;
-                } else [[unlikely]] {
+                } else {
                     __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
                 }
             } else {
@@ -903,9 +965,7 @@ class h2_impl : HPackImpl {
                     __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
                 }
                 // check strm state
-                if (strm.template state_any_of<
-                        StreamStates::ReservedLocal, StreamStates::Open,
-                        StreamStates::HalfClosedRemote>()) {
+                if (strm.state != StreamStates::Open) {
                     return;
                 } else {
                     __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
@@ -1415,6 +1475,8 @@ class h2_impl : HPackImpl {
         do_send();
     }
 
+    // TODO: make better flow control
+
     void create_DATA_flush(decltype(__M_strms)::iterator strm_ite) {
         stream_id_type strm_id = strm_ite->first;
         h2_stream& strm = strm_ite->second;
@@ -1537,16 +1599,6 @@ class h2_impl : HPackImpl {
         }
     }
 
-    constexpr static void safe_window_inc(int& v, int i) {
-        if (v + i >= std::max(v, i)) {
-            v += i;
-            return;
-        } else {
-            // ah, no rst. shutdown even for stream
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FLOW_CONTROL_ERROR));
-        }
-    }
-
     struct impl_detail {
         static constexpr char client_connection_preface_cstr[] = {
             'P', 'R', 'I',  ' ',  '*',  ' ',  'H', 'T', 'T',  'P',  '/',  '2',
@@ -1592,4 +1644,6 @@ decltype(auto) async_http2(Stream&& stream, std::unique_ptr<Session> session,
 /*
 TODO:
 1. remove payload vector of frame later
+1.1 payload isn't necessary for DATA, since chxhttp actually doesn't care about
+what DATA contains.
 */

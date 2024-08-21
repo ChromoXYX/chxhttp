@@ -7,7 +7,6 @@
 #include "../log.hpp"
 #include "./h2_log.hpp"
 #include "../http_related/mime.hpp"
-#include "../http_related/etag.hpp"
 
 #include <chx/http/h2/async_http2.hpp>
 #include <chx/net/file.hpp>
@@ -204,8 +203,19 @@ class h2_session {
             return response_4xx(cntl, strm_id, http::status_code::Bad_Request);
         }
         if (header_frame.get_END_STREAM()) {
+            log_norm(CHXLOG_STR("enter\n"));
             work(cntl, strm_id, strm.preq);
         }
+    }
+
+    template <typename Cntl>
+    void operator()(Cntl& cntl, h2::stream_id_type strm_id,
+                    stream_userdata_type& strm, h2::data_frame_block,
+                    const unsigned char* begin, const unsigned char* end) {
+        if (strm.preq.use_count() > 1) {
+            __CHXHTTP_H2RT_THROW(h2::make_ec(h2::ErrorCodes::PROTOCOL_ERROR));
+        }
+        log_norm(CHXLOG_STR("recv bytes %lu\n"), end - begin);
     }
 
     template <typename Cntl>
@@ -215,43 +225,58 @@ class h2_session {
         if (strm.preq.use_count() > 1) {
             __CHXHTTP_H2RT_THROW(h2::make_ec(h2::ErrorCodes::PROTOCOL_ERROR));
         }
-        bool is_END_STREAM = data_frame.get_END_STREAM();
         request_type& req = *strm.preq;
-        if (!ignore_DATA_frame(strm)) {
-            if (auto ite = req.fields.find("content-length");
-                ite != req.fields.end()) {
-                std::size_t content_length = 0;
-                std::from_chars_result r = std::from_chars(
-                    ite->second.c_str(),
-                    ite->second.c_str() + ite->second.size(), content_length);
-                if (r.ptr != ite->second.c_str() + ite->second.size())
-                    [[unlikely]] {
-                    log_norm_h2(req, cntl.stream(),
-                                http::status_code::Bad_Request);
-                    return response_4xx(cntl, strm_id,
-                                        http::status_code::Bad_Request);
-                }
-                std::size_t recv_len = data_frame.end() - data_frame.begin();
-                for (auto& v : req.payload) {
-                    recv_len += v.size();
-                }
-                if (recv_len > content_length) [[unlikely]] {
-                    log_norm_h2(req, cntl.stream(),
-                                http::status_code::Bad_Request);
-                    return response_4xx(cntl, strm_id,
-                                        http::status_code::Bad_Request);
-                }
-            }
-            if (data_frame.get_PADDED()) {
-                req.payload.emplace_back(data_frame.begin(), data_frame.end());
-            } else {
-                req.payload.emplace_back(std::move(data_frame.payload));
-            }
-        }
-        if (is_END_STREAM) {
+        if (data_frame.get_END_STREAM()) {
             work(cntl, strm_id, strm.preq);
         }
     }
+
+    // template <typename Cntl>
+    // void operator()(Cntl& cntl, h2::stream_id_type strm_id,
+    //                 stream_userdata_type& strm,
+    //                 h2::views::data_type data_frame) {
+    //     if (strm.preq.use_count() > 1) {
+    //         __CHXHTTP_H2RT_THROW(h2::make_ec(h2::ErrorCodes::PROTOCOL_ERROR));
+    //     }
+    //     bool is_END_STREAM = data_frame.get_END_STREAM();
+    //     request_type& req = *strm.preq;
+    //     if (!ignore_DATA_frame(strm)) {
+    //         if (auto ite = req.fields.find("content-length");
+    //             ite != req.fields.end()) {
+    //             std::size_t content_length = 0;
+    //             std::from_chars_result r = std::from_chars(
+    //                 ite->second.c_str(),
+    //                 ite->second.c_str() + ite->second.size(),
+    //                 content_length);
+    //             if (r.ptr != ite->second.c_str() + ite->second.size())
+    //                 [[unlikely]] {
+    //                 log_norm_h2(req, cntl.stream(),
+    //                             http::status_code::Bad_Request);
+    //                 return response_4xx(cntl, strm_id,
+    //                                     http::status_code::Bad_Request);
+    //             }
+    //             std::size_t recv_len = data_frame.end() - data_frame.begin();
+    //             for (auto& v : req.payload) {
+    //                 recv_len += v.size();
+    //             }
+    //             if (recv_len > content_length) [[unlikely]] {
+    //                 log_norm_h2(req, cntl.stream(),
+    //                             http::status_code::Bad_Request);
+    //                 return response_4xx(cntl, strm_id,
+    //                                     http::status_code::Bad_Request);
+    //             }
+    //         }
+    //         if (data_frame.get_PADDED()) {
+    //             req.payload.emplace_back(data_frame.begin(),
+    //             data_frame.end());
+    //         } else {
+    //             req.payload.emplace_back(std::move(data_frame.payload));
+    //         }
+    //     }
+    //     if (is_END_STREAM) {
+    //         work(cntl, strm_id, strm.preq);
+    //     }
+    // }
 
     template <typename Cntl, typename... Ts>
     static void response_2xx(Cntl& cntl, h2::stream_id_type strm_id,

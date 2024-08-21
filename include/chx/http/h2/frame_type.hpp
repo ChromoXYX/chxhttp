@@ -64,16 +64,6 @@ struct views {
         constexpr bool get_END_STREAM() const noexcept(true) {
             return flags & END_STREAM;
         }
-
-        constexpr std::uint8_t pad_length() const noexcept(true) {
-            return !get_PADDED() ? 0 : payload[0];
-        }
-        constexpr std::vector<unsigned char>::iterator begin() noexcept(true) {
-            return payload.begin() + get_PADDED();
-        }
-        constexpr std::vector<unsigned char>::iterator end() noexcept(true) {
-            return payload.end() - pad_length();
-        }
     };
     struct headers_type : frame_type {
         headers_type(const headers_type&) = default;
@@ -190,4 +180,6 @@ struct views {
         }
     };
 };
+
+struct data_frame_block {};
 }  // namespace chx::http::h2

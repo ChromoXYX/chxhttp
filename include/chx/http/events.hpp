@@ -2,8 +2,9 @@
 
 namespace chx::http {
 struct connection_start {};
-struct message_begin {};
+struct message_start {};
 struct header_complete {};
+struct data_block {};
 struct message_complete {};
 
 struct bad_request {};

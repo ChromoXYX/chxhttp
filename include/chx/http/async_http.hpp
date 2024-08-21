@@ -78,7 +78,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
             if (io_cntl.want_recv()) {
                 __M_next = __M_inbuf.data();
                 __M_avail = s;
-                feed();
+                feed2();
                 do_read();
                 do_send();
             }
@@ -212,6 +212,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
         if (code == status_code::Bad_Request ||
             static_cast<unsigned short>(code) >= 500) {
             io_cntl.send_goaway();
+            io_cntl.shutdown_recv();
         }
         do_send();
     }
@@ -220,6 +221,7 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
         if (code == status_code::Bad_Request ||
             static_cast<unsigned short>(code) >= 500) {
             io_cntl.send_goaway();
+            io_cntl.shutdown_recv();
         }
         do_send();
     }
@@ -270,15 +272,17 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
         constexpr settings_t() {
             s.on_body = [](llhttp_t* c, const char* p, std::size_t s) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                if (self->__M_parse_state.want_data) {
-                    if (self->__M_parse_state.current_size + s <=
-                        self->__M_parse_state.current_max) {
-                        self->__M_parse_state.current_size += s;
-                        self->__M_request.body.insert(
-                            self->__M_request.body.end(), p, p + s);
-                    } else {
-                        return -1;
+                if (self->__M_parse_state.current_size + s <=
+                    self->__M_parse_state.current_max) {
+                    self->__M_parse_state.current_size += s;
+                    try {
+                        on<data_block>(self->session(), self->__M_request,
+                                       *self, p, p + s);
+                    } catch (const std::exception& ex) {
+                        return HPE_USER;
                     }
+                } else {
+                    return -1;
                 }
                 return HPE_OK;
             };
@@ -315,18 +319,28 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
 
             s.on_message_begin = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                on<message_begin>(self->session(), *self);
+                on<message_start>(self->session(), *self);
                 return HPE_OK;
             };
             s.on_headers_complete = [](llhttp_t* c) -> int {
-                static_cast<operation*>(c->data)->__M_parse_state.why =
-                    parse_state::HeadersComplete;
-                return HPE_PAUSED;
+                operation* self = static_cast<operation*>(c->data);
+                try {
+                    on<header_complete>(self->session(), self->__M_request,
+                                        *self);
+                } catch (const std::exception& ex) {
+                    return HPE_PAUSED;
+                }
+                return HPE_OK;
             };
             s.on_message_complete = [](llhttp_t* c) -> int {
-                static_cast<operation*>(c->data)->__M_parse_state.why =
-                    parse_state::MsgComplete;
-                return HPE_PAUSED;
+                operation* self = static_cast<operation*>(c->data);
+                try {
+                    on<message_complete>(self->session(), self->__M_request,
+                                         *self);
+                } catch (const std::exception& ex) {
+                    return HPE_PAUSED;
+                }
+                return HPE_OK;
             };
         }
     } constexpr static inline settings = {};
@@ -338,9 +352,6 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
 
     request_type __M_request;
     struct parse_state {
-        enum Why { Waiting, HeadersComplete, MsgComplete, Error } why = Waiting;
-        bool want_data = true;
-        bool need_exec = true;
         std::size_t current_max = 4096;
         ssize_t current_size = 0;
     } __M_parse_state;
@@ -397,64 +408,48 @@ struct operation : CHXNET_NONCOPYABLE /*, StreamAccessor*/ {
         }
     }
 
-    // weak exception guarantee
-    // that is, if anything throws, cntl.complete() is guaranteed to be called
-    void feed() {
-        if (io_cntl.want_recv()) {
-            if (__M_avail ||
-                __M_parse_state.why == __M_parse_state.HeadersComplete) {
-                llhttp_errno r;
-                try {
-                    r = llhttp_execute(&__M_parser, __M_next, __M_avail);
-                } catch (...) {
-                    std::rethrow_exception(std::current_exception());
-                }
-                if (r == HPE_PAUSED) {
-                    llhttp_resume(&__M_parser);
-                    __M_avail -= llhttp_get_error_pos(&__M_parser) - __M_next;
-                    __M_next = llhttp_get_error_pos(&__M_parser);
-                    try {
-                        if (__M_parse_state.why ==
-                            __M_parse_state.HeadersComplete) {
-                            __M_parse_state.want_data = false;
-                            on<header_complete>(session(), __M_request,
-                                                *this);
-                        } else {
-                            if (__M_request.fields.exactly_contains(
-                                    "connection", "close")) {
-                                h11_shutdown_recv();
-                            }
-                            on<message_complete>(session(), __M_request,
-                                                 *this);
-                            parse_restart();
-                        }
-                    } catch (const std::exception& e) {
-                        struct user_ise {
-                            fields_type fields;
+    // 24.8.19 found it hard to understand feed(), so made feed2() :(
+    void feed2() {
+        if (io_cntl.want_recv() && __M_avail) {
+            llhttp_errno r;
+            try {
+                r = llhttp_execute(&__M_parser, __M_next, __M_avail);
+            } catch (...) {
+                std::rethrow_exception(std::current_exception());
+            }
+            switch (r) {
+            case HPE_OK: {
+                // everything was ok
+                break;
+            }
+            case HPE_USER:
+                // data_block throws
+            case HPE_PAUSED: {
+                // header_complete or message_complete throws, should response
+                // with 500 and shutdown
+                struct user_ise {
+                    fields_type fields;
 
-                            user_ise() {
-                                fields.set_field("Server", "chxhttp.h11");
-                                fields.set_field("Connection", "close");
-                            }
-                        } static const ise;
-                        response(status_code::Internal_Server_Error,
-                                 ise.fields);
+                    user_ise() {
+                        fields.set_field("Server", "chxhttp.h11");
+                        fields.set_field("Connection", "close");
                     }
-                    feed();
-                } else if (r == HPE_OK) {
-                    __M_avail = 0;
-                    __M_next = nullptr;
-                } else {
-                    struct badrequest {
-                        fields_type fields;
+                } static const ise;
+                response(status_code::Internal_Server_Error, ise.fields);
+                break;
+            }
+                // something else, and bad request
+            default: {
+                struct badrequest {
+                    fields_type fields;
 
-                        badrequest() {
-                            fields.set_field("Server", "chxhttp.h11");
-                            fields.set_field("Connection", "close");
-                        }
-                    } static const ise;
-                    response(status_code::Bad_Request, ise.fields);
-                }
+                    badrequest() {
+                        fields.set_field("Server", "chxhttp.h11");
+                        fields.set_field("Connection", "close");
+                    }
+                } static const br;
+                response(status_code::Bad_Request, br.fields);
+            }
             }
         }
     }

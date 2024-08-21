@@ -9,6 +9,6 @@ struct request_type {
     std::string request_target;
     fields_type fields;
 
-    std::vector<unsigned char> body;
+    // std::vector<unsigned char> body;
 };
 }  // namespace chx::http
