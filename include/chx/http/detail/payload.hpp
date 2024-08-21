@@ -26,7 +26,7 @@ struct payload_rep {
     payload_rep() = default;
     payload_rep(payload_rep&&) = default;
     template <typename T>
-    payload_rep(std::unique_ptr<T> ptr) : payload(ptr.release()) {}
+    payload_rep(std::unique_ptr<T> ptr) : payload(std::move(ptr)) {}
 
     payload_rep& operator=(payload_rep&&) = default;
 

@@ -9,6 +9,7 @@
 #include <map>
 #include <array>
 #include <numeric>
+#include <queue>
 #include <set>
 
 #include "../detail/payload.hpp"
@@ -67,15 +68,13 @@ class h2_impl : HPackImpl {
         struct static_preface_vec {
             std::vector<views::settings_type::setting_type> v;
 
-            static_preface_vec() : v(4) {
+            static_preface_vec() : v(3) {
                 v[0].identifier(Settings::SETTINGS_NO_RFC7540_PRIORITIES);
                 v[0].value(1);
-                v[1].identifier(Settings::SETTINGS_INITIAL_WINDOW_SIZE);
-                v[1].value(65535);
-                v[2].identifier(Settings::SETTINGS_MAX_FRAME_SIZE);
-                v[2].value(16384);
-                v[3].identifier(Settings::SETTINGS_MAX_CONCURRENT_STREAMS);
-                v[3].value(100);
+                v[1].identifier(Settings::SETTINGS_MAX_FRAME_SIZE);
+                v[1].value(16384);
+                v[2].identifier(Settings::SETTINGS_MAX_CONCURRENT_STREAMS);
+                v[2].value(100);
             }
         } static preface_vec = {};
         try {
@@ -333,23 +332,40 @@ class h2_impl : HPackImpl {
                               payload_variant(std::in_place_index_t<2>{}));
     }
 
+    // new DATA impl
+    struct data_task_t {
+        flags_type flags = 0;
+        std::size_t sz = 0;
+        std::unique_ptr<payload_store> payload;
+        std::vector<net::iovec_buffer> iovec;
+
+        template <typename... Ts>
+        static data_task_t create(flags_type flags, Ts&&... ts) {
+            data_task_t task = {};
+            task.flags = flags;
+
+            std::unique_ptr payload =
+                payload_store::create(std::forward<Ts>(ts)...);
+            task.iovec = http::detail::create_iovec_vector(payload->data);
+            task.sz = std::accumulate(
+                task.iovec.begin(), task.iovec.end(), std::size_t{0},
+                [](std::size_t r, const net::iovec_buffer& a) {
+                    return r + a.size();
+                });
+            task.payload = std::move(payload);
+            return std::move(task);
+        }
+    };
+    // end
+
     struct h2_stream : session_stream_userdata_type {
         StreamStates state = StreamStates::Idle;
         int client_window = 65535;
         int server_window = 65535;
 
         std::vector<frame_type> field_blocks;
-        std::vector<frame_type> after;
 
-        std::vector<pending_frame_type> pending_DATA_frames;
-        template <typename... Ts>
-        constexpr auto&
-        pending_DATA_frames_emplace_back(std::array<unsigned char, 9>&& header,
-                                         Ts&&... ts) {
-            return __pending_frame_type_emplace_back(pending_DATA_frames,
-                                                     std::move(header),
-                                                     std::forward<Ts>(ts)...);
-        }
+        std::queue<data_task_t> pending_DATA_tasks;
 
         template <StreamStates... St>
         constexpr bool state_any_of() const noexcept(true) {
@@ -361,6 +377,7 @@ class h2_impl : HPackImpl {
     };
     std::map<stream_id_type, h2_stream> __M_strms;
     std::set<stream_id_type> __M_strms_seek_for_window;
+
     using strms_iterator = std::map<stream_id_type, h2_stream>::iterator;
     // bytes client can send
     int client_conn_window = 65535;
@@ -863,13 +880,20 @@ class h2_impl : HPackImpl {
         };
         if (view.stream_id == 0) {
             server_conn_window = safe_inc(server_conn_window, inc);
-            
+            for (auto ite = __M_strms.begin();
+                 server_conn_window > 0 && ite != __M_strms.end();) {
+                h2_stream& strm = ite->second;
+                auto cur = ite++;
+                if (!strm.pending_DATA_tasks.empty()) {
+                    create_DATA_flush2(cur);
+                }
+            }
         } else {
             auto ite = __M_strms.find(view.stream_id);
             if (ite != __M_strms.end()) {
                 h2_stream& strm = ite->second;
                 strm.server_window = safe_inc(strm.server_window, inc);
-                create_DATA_flush(ite);
+                create_DATA_flush2(ite);
             }
         }
         // invoke
@@ -934,7 +958,12 @@ class h2_impl : HPackImpl {
                 }
                 printf("remain window %d %d\n", client_conn_window,
                        strm.client_window);
-                if (client_conn_window == 0 || strm.client_window == 0) {
+                if (client_conn_window == 0) {
+                    create_WINDOW_UPDATE_frame(0, 65535);
+                }
+                if (strm.client_window == 0) {
+                    create_WINDOW_UPDATE_frame(
+                        frame.stream_id, conn_settings.initial_window_size);
                 }
                 // check prev frame
                 if (!frame_check_before_payload_no_prev(strm)) [[unlikely]] {
@@ -1243,8 +1272,8 @@ class h2_impl : HPackImpl {
     }
 
     template <typename... Ts>
-    void create_DATA_frame(flags_type flags, stream_id_type strm_id,
-                           Ts&&... ts) {
+    void create_DATA_frame2(flags_type flags, stream_id_type strm_id,
+                            Ts&&... ts) {
         auto ite = __M_strms.find(strm_id);
         if (ite == __M_strms.end()) [[unlikely]] {
             __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
@@ -1258,96 +1287,18 @@ class h2_impl : HPackImpl {
         if constexpr (sizeof...(Ts)) {
             total_size = (... + net::buffer(ts).size());
         }
-        if (total_size != 0) {
-            int min_window = std::min(server_conn_window, strm.server_window);
-            if (total_size <= min_window) {
-                server_conn_window -= total_size;
-                strm.server_window -= total_size;
-                if (total_size <= conn_settings.max_frame_size) {
-                    auto store = payload_store::create(std::forward<Ts>(ts)...);
-                    auto iovec = http::detail::create_iovec_vector(store->data);
-                    auto header_arr = create_frame_header_helper(
-                        FrameType::DATA, total_size, flags, strm_id);
-                    pending_frames_emplace_back(std::move(header_arr),
-                                                payload_rep{std::move(store)},
-                                                std::move(iovec));
-                } else {
-                    auto store = payload_store::create(std::forward<Ts>(ts)...);
-                    std::vector<net::iovec_buffer> iovec =
-                        http::detail::create_iovec_vector(store->data);
-                    while (!iovec.empty()) {
-                        std::size_t n = 0;
-                        std::vector<net::iovec_buffer> section =
-                            iovec_generator(iovec, conn_settings.max_frame_size,
-                                            &n);
 
-                        auto header = create_frame_header_helper(
-                            FrameType::DATA, n,
-                            flags & (~frame_type::END_STREAM), strm_id);
-                        pending_frames_emplace_back(std::move(header),
-                                                    payload_rep{},
-                                                    std::move(section));
-                    }
-                    assert(!pending_frames.empty());
-                    std::get<0>(std::get<0>(std::get<1>(pending_frames.back())))
-                        .payload.reset(store.release());
-                    set_flags_to_array(std::get<0>(pending_frames.back()),
-                                       flags);
-                }
-                if (flags & frame_type::END_STREAM) {
-                    send_ES_lifecycle(ite);
-                }
-            } else {
-                // total_size > min_window
-                assert(min_window >= 0);
-                auto store = payload_store::create(std::forward<Ts>(ts)...);
-                auto iovec = http::detail::create_iovec_vector(store->data);
-                __M_strms_seek_for_window.insert(strm_id);
-                if (min_window <= conn_settings.max_frame_size) {
-                    server_conn_window -= min_window;
-                    strm.server_window -= min_window;
-                    std::vector<net::iovec_buffer> inwnd =
-                        iovec_generator(iovec, min_window);
-                    pending_frames_emplace_back(
-                        create_frame_header_helper(
-                            FrameType::DATA, min_window,
-                            flags & (~frame_type::END_STREAM), strm_id),
-                        payload_rep{}, std::move(inwnd));
-                    strm.pending_DATA_frames_emplace_back(
-                        create_frame_header_helper(FrameType::DATA,
-                                                   total_size - min_window,
-                                                   flags, strm_id),
-                        std::move(store), std::move(iovec));
-                } else {
-                    // window > max frame size
-                    server_conn_window -= min_window;
-                    strm.server_window -= min_window;
-                    std::vector<net::iovec_buffer> inwnd =
-                        iovec_generator(iovec, min_window);
-                    while (!inwnd.empty()) {
-                        std::size_t n = 0;
-                        std::vector<net::iovec_buffer> section =
-                            iovec_generator(inwnd, conn_settings.max_frame_size,
-                                            &n);
-                        pending_frames_emplace_back(
-                            create_frame_header_helper(
-                                FrameType::DATA, n,
-                                flags & (~frame_type::END_STREAM), strm_id),
-                            payload_rep{}, std::move(section));
-                    }
-                    assert(!iovec.empty());
-                    strm.pending_DATA_frames_emplace_back(
-                        create_frame_header_helper(FrameType::DATA,
-                                                   total_size - min_window,
-                                                   flags, strm_id),
-                        std::move(store), std::move(iovec));
-                }
-            }
+        if (total_size) {
+            strm.pending_DATA_tasks.push(
+                data_task_t::create(flags, std::forward<Ts>(ts)...));
+            create_DATA_flush2(ite);
         } else {
             pending_frames_emplace_back(
                 create_frame_header_helper(FrameType::DATA, 0, flags, strm_id));
+            if (flags & Flags::END_STREAM) {
+                send_ES_lifecycle(ite);
+            }
         }
-        // do_send();
     }
 
     void create_RST_STREAM_frame(stream_id_type strm_id, ErrorCodes ec) {
@@ -1476,95 +1427,61 @@ class h2_impl : HPackImpl {
     }
 
     // TODO: make better flow control
+    // 24.08.21 so we need a better DATA impl!
 
-    void create_DATA_flush(decltype(__M_strms)::iterator strm_ite) {
-        stream_id_type strm_id = strm_ite->first;
-        h2_stream& strm = strm_ite->second;
-        auto ite = strm.pending_DATA_frames.begin();
-        for (int wnd = std::min(strm.server_window, server_conn_window);
-             ite != strm.pending_DATA_frames.end() && wnd;
-             ++ite, wnd = std::min(strm.server_window, server_conn_window)) {
-            auto& [header, va] = *ite;
-            static_assert(std::is_same_v<std::decay_t<decltype(header)>,
-                                         std::array<unsigned char, 9>>);
-            flags_type flags = get_flags_from_array(header);
-            assert(va.index() == 0);
-            auto& [rep, iov] = std::get<0>(va);
-            std::size_t len = std::accumulate(
-                iov.begin(), iov.end(), std::size_t{},
-                [](std::size_t s, const net::iovec_buffer& buf) {
-                    return s + buf.size();
-                });
-            if (len <= wnd) {
-                strm.server_window -= len;
+    void create_DATA_flush2(strms_iterator ite) {
+        stream_id_type strm_id = ite->first;
+        h2_stream& strm = ite->second;
+        auto& tasks = strm.pending_DATA_tasks;
+        for (int wnd = std::min(server_conn_window, strm.server_window);
+             !tasks.empty() && wnd > 0;) {
+            data_task_t& task = tasks.front();
+            // bytes could be sent of this task
+            std::size_t avail_sz =
+                std::min(static_cast<std::size_t>(wnd), task.sz);
+            while (avail_sz) {
+                const std::size_t len = std::min(
+                    avail_sz,
+                    static_cast<std::size_t>(conn_settings.max_frame_size));
+                std::size_t cur_sz = 0;
+                std::vector<net::iovec_buffer> iov =
+                    iovec_generator(task.iovec, len, &cur_sz);
+
+                assert(cur_sz == len);
+                assert(len <= wnd && len <= task.sz && len <= avail_sz);
                 server_conn_window -= len;
-                if (len <= conn_settings.max_frame_size) {
-                    pending_frames_emplace_back(std::move(header),
-                                                std::move(rep), std::move(iov));
+                strm.server_window -= len;
+                wnd -= len;
+                avail_sz -= len;
+                task.sz -= len;
+
+                if (task.sz) {
+                    // DATA task not completed
+                    pending_frames_emplace_back(
+                        create_frame_header_helper(FrameType::DATA, len, 0,
+                                                   strm_id),
+                        payload_rep{}, std::move(iov));
                 } else {
-                    while (!iov.empty()) {
-                        std::size_t n = 0;
-                        std::vector<net::iovec_buffer> ciov = iovec_generator(
-                            iov, conn_settings.max_frame_size, &n);
-                        pending_frames_emplace_back(
-                            create_frame_header_helper(
-                                FrameType::DATA, n,
-                                flags & (~frame_type::END_STREAM), strm_id),
-                            payload_rep{}, std::move(ciov));
-                    }
-                    std::get<0>(std::get<0>(
-                        std::get<1>(pending_frames.back()))) = std::move(rep);
-                    set_flags_to_array(std::get<0>(pending_frames.back()),
-                                       flags);
-                }
-                if (flags & frame_type::END_STREAM) {
-                    strm.pending_DATA_frames.clear();
-                    send_ES_lifecycle(strm_ite);
-                    // do_send();
-                    return;
-                }
-            } else {
-                strm.server_window -= wnd;
-                server_conn_window -= wnd;
-                if (wnd <= conn_settings.max_frame_size) {
-                    std::size_t n = 0;
-                    std::vector<net::iovec_buffer> ciov =
-                        iovec_generator(iov, wnd, &n);
-                    assert(n == wnd);
+                    assert(avail_sz == 0);
+                    // DATA task completed
                     pending_frames_emplace_back(
                         create_frame_header_helper(
-                            FrameType::DATA, wnd,
-                            flags & (~frame_type::END_STREAM), strm_id),
-                        payload_rep{}, std::move(ciov));
-                } else {
-                    std::size_t bytes_sent = 0;
-                    while (bytes_sent < wnd) {
-                        std::size_t n = 0;
-                        std::vector<net::iovec_buffer> ciov = iovec_generator(
-                            iov,
-                            std::min(static_cast<std::size_t>(
-                                         conn_settings.max_frame_size),
-                                     wnd - bytes_sent),
-                            &n);
-                        bytes_sent += n;
-                        pending_frames_emplace_back(
-                            create_frame_header_helper(
-                                FrameType::DATA, n,
-                                flags & (~frame_type::END_STREAM), strm_id),
-                            payload_rep{}, std::move(ciov));
-                    }
-                    assert(bytes_sent == wnd);
+                            FrameType::DATA, len,
+                            (task.flags & Flags::END_STREAM) ? Flags::END_STREAM
+                                                             : 0,
+                            strm_id),
+                        payload_rep{std::move(task.payload)}, std::move(iov));
                 }
-                detail::to_network4(len - wnd, header.data(), 3);
+            }
+            if (task.sz == 0) {
+                tasks.pop();
+                if (task.flags & Flags::END_STREAM) {
+                    return send_ES_lifecycle(ite);
+                }
+            } else {
+                assert(wnd == 0);
             }
         }
-        if (ite != strm.pending_DATA_frames.end()) {
-            strm.pending_DATA_frames.erase(strm.pending_DATA_frames.begin(),
-                                           ite);
-        } else {
-            __M_strms_seek_for_window.erase(strm_ite->first);
-        }
-        // do_send();
     }
 
     constexpr static std::size_t
