@@ -459,7 +459,6 @@ struct operation : CHXNET_NONCOPYABLE,
             }
             case HPE_USER:
             case HPE_PAUSED: {
-                printf("%d\n", r);
                 if (io_cntl.goaway_sent()) {
                     break;
                 }

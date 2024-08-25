@@ -1146,21 +1146,18 @@ class h2_impl : HPackImpl {
         return std::move(_r);
     }
 
-    constexpr std::array<unsigned char, 9>
+    std::array<unsigned char, 9>
     create_frame_header_helper(FrameType ft, std::size_t len, flags_type flags,
                                stream_id_type strm_id) noexcept(true) {
         std::array<unsigned char, 9> _r;
-        _r[0] = len >> 16;
-        _r[1] = len >> 8;
-        _r[2] = len;
+        std::uint32_t len_network = htonl(len);
+        ::memcpy(_r.data(), &len_network, 3);
 
         _r[3] = static_cast<unsigned char>(ft);
         _r[4] = flags;
 
-        _r[5] = strm_id >> 24;
-        _r[6] = strm_id >> 16;
-        _r[7] = strm_id >> 8;
-        _r[8] = strm_id;
+        std::uint32_t strm_id_network = htonl(strm_id);
+        ::memcpy(_r.data() + 5, &strm_id_network, 4);
         return _r;
     }
 
