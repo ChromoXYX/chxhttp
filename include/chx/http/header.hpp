@@ -3,11 +3,21 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
 namespace chx::http {
 class fields_type {
     using __container_type = std::vector<std::pair<std::string, std::string>>;
     __container_type __M_v;
+
+    static bool __ncase_cmp(std::string_view a,
+                            std::string_view b) noexcept(true) {
+        if (a.size() == b.size()) {
+            return ::strncasecmp(a.data(), b.data(), a.size()) == 0;
+        } else {
+            return false;
+        }
+    }
 
   public:
     using value_type = typename __container_type::value_type;
@@ -50,22 +60,14 @@ class fields_type {
 
     constexpr iterator_type find(std::string_view key) noexcept(true) {
         return std::find_if(
-            __M_v.begin(), __M_v.end(), [key](const auto& i) -> bool {
-                return std::equal(key.begin(), key.end(), i.first.begin(),
-                                  i.first.end(), [](char a, char b) -> bool {
-                                      return std::tolower(a) == std::tolower(b);
-                                  });
-            });
+            __M_v.begin(), __M_v.end(),
+            [key](const auto& i) -> bool { return __ncase_cmp(key, i.first); });
     }
     constexpr const_iterator_type find(std::string_view key) const
         noexcept(true) {
         return std::find_if(
-            __M_v.begin(), __M_v.end(), [key](const auto& i) -> bool {
-                return std::equal(key.begin(), key.end(), i.first.begin(),
-                                  i.first.end(), [](char a, char b) -> bool {
-                                      return std::tolower(a) == std::tolower(b);
-                                  });
-            });
+            __M_v.begin(), __M_v.end(),
+            [key](const auto& i) -> bool { return __ncase_cmp(key, i.first); });
     }
     constexpr bool contains(std::string_view key) const noexcept(true) {
         return find(key) != __M_v.end();

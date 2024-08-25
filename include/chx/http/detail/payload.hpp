@@ -15,7 +15,9 @@ struct payload_store {
             impl(impl&&) = default;
             impl(Ts&&... ts) : data(std::forward<Ts>(ts)...) {}
 
-            std::tuple<std::remove_reference_t<Ts>...> data;
+            std::tuple<std::conditional_t<std::is_lvalue_reference_v<Ts&&>,
+                                          Ts&&, std::remove_reference_t<Ts>>...>
+                data;
 
             using data_len = std::integral_constant<std::size_t, sizeof...(Ts)>;
         };

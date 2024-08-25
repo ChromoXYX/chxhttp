@@ -180,6 +180,4 @@ struct views {
         }
     };
 };
-
-struct data_frame_block {};
 }  // namespace chx::http::h2

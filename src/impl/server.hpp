@@ -2,4 +2,4 @@
 
 #include <cstddef>
 
-std::size_t boot_h1();
+std::size_t boot_h11();

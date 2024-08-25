@@ -12,6 +12,7 @@
 #include <queue>
 #include <set>
 
+#include "../session_closed.hpp"
 #include "../detail/payload.hpp"
 #include "./exception.hpp"
 #include "./types.hpp"
@@ -19,6 +20,7 @@
 #include "./error_codes.hpp"
 #include "./settings.hpp"
 #include "./detail/copy_integer.hpp"
+#include "../events.hpp"
 
 namespace chx::http::h2::detail::tags {
 struct http2_impl {};
@@ -268,23 +270,14 @@ class h2_impl : HPackImpl {
     std::vector<unsigned char> __M_inbuf;
 
     http::h2::frame_type frame_parse;
-    enum class DataFrameStatus : std::uint8_t {
-        DATA_PAD,
-        DATA_BODY,
-        DATA_TAIL
-    };
     struct {
+        stream_id_type next_header_strm = 0;
         std::uint8_t padded_length = 0;
-        DataFrameStatus status = DataFrameStatus::DATA_PAD;
     } data_fsm;
     enum class StreamStates : int {
-        Idle,
-        ReservedLocal,
-        ReservedRemote,
         Open,
         HalfClosedRemote,
         HalfClosedLocal,
-        // Closed
     };
 
     using payload_rep = http::detail::payload_rep;
@@ -359,10 +352,11 @@ class h2_impl : HPackImpl {
     // end
 
     struct h2_stream : session_stream_userdata_type {
-        StreamStates state = StreamStates::Idle;
+        StreamStates state = StreamStates::Open;
         int client_window = 65535;
         int server_window = 65535;
 
+        fields_type fields;
         std::vector<frame_type> field_blocks;
 
         std::queue<data_task_t> pending_DATA_tasks;
@@ -498,15 +492,17 @@ class h2_impl : HPackImpl {
                         }
                     } else {
                         // process frame...
-                        if (frame_parse.type != FrameType::DATA) {
-                            process_frame();
+                        if (frame_parse.type == FrameType::HEADERS ||
+                            frame_parse.type == FrameType::CONTINUATION) {
+                            feed_header(frame_parse, ptr, end);
+                        } else if (frame_parse.type == FrameType::DATA) {
+                            feed_data2(frame_parse, ptr, end);
                         } else {
-                            const unsigned char* old = ptr;
-                            feed_data(frame_parse, ptr, end);
-                            assert(ptr == old);
+                            process_frame();
+                            frame_parse.clear();
+                            __pstatus = __Start;
                         }
-                        frame_parse.clear();
-                        __pstatus = __Start;
+                        assert(__pstatus == __Start);
                     }
                     break;
                 } else {
@@ -517,7 +513,10 @@ class h2_impl : HPackImpl {
             }
             case __FrameHeader: {
                 if (frame_parse.type == FrameType::DATA) {
-                    feed_data(frame_parse, ptr, end);
+                    feed_data2(frame_parse, ptr, end);
+                } else if (frame_parse.type == FrameType::HEADERS ||
+                           frame_parse.type == FrameType::CONTINUATION) {
+                    feed_header(frame_parse, ptr, end);
                 } else if (end - ptr >=
                            frame_parse.length - frame_parse.payload_length) {
                     std::size_t old = frame_parse.payload_length;
@@ -569,99 +568,197 @@ class h2_impl : HPackImpl {
         }
     }
 
-    void feed_data(frame_type& frame, const unsigned char*& ptr,
-                   const unsigned char* end) {
-        const unsigned char* tail =
-            ptr + std::min(frame.length - frame.payload_length,
-                           static_cast<unsigned int>(end - ptr));
+    void feed_data2(frame_type& frame, const unsigned char*& ptr,
+                    const unsigned char* end) {
         auto ite = __M_strms.find(frame.stream_id);
-        if (ite == __M_strms.end()) {
+        if (ite == __M_strms.end()) [[unlikely]] {
             __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
         }
         h2_stream& strm = ite->second;
-        if (!(frame.flags & frame.PADDED)) {
-            const std::size_t consumed = tail - ptr;
-            assert(frame.payload_length + consumed <= frame.length);
-            on(*this, frame.stream_id, strm, data_frame_block{}, ptr, tail);
-            ptr = tail;
+
+        const unsigned char* begin = ptr;
+        std::size_t avail = std::min(frame.length - frame.payload_length,
+                                     static_cast<length_type>(end - begin));
+
+        if (!(frame.flags & Flags::PADDED)) {
+            // no padded
+            const std::size_t consumed = avail;
+            on(*this, frame.stream_id, strm, data_block{}, ptr, ptr + consumed);
+            ptr += consumed;
             frame.payload_length += consumed;
-            if (frame.length == frame.payload_length) {
+            avail -= consumed;
+
+            if (frame.payload_length == frame.length) {
                 if (frame.flags & Flags::END_STREAM) {
-                    // open -> half-closed remote or half-closed local to closed
-                    // same as HEADER frame, chxhttp would never send ES on open
+                    strm.state = StreamStates::HalfClosedRemote;
+                }
+
+                on(*this, frame.stream_id, strm,
+                   views::data_type(std::move(frame)));
+                frame.clear();
+                __pstatus = __Start;
+            }
+        } else {
+            // padded
+            if (frame.payload_length == 0) {
+                data_fsm.padded_length = *(ptr++);
+                ++frame.payload_length;
+                --avail;
+            }
+            if (avail == 0) [[unlikely]] {
+                return;
+            }
+
+            const std::size_t payload_end =
+                frame.length - data_fsm.padded_length;
+            if (frame.payload_length < payload_end) {
+                const std::size_t consumed =
+                    std::min(avail, payload_end - frame.payload_length);
+                on(*this, frame.stream_id, strm, data_block{}, ptr,
+                   ptr + consumed);
+                ptr += consumed;
+                frame.payload_length += consumed;
+                avail -= consumed;
+            }
+            if (avail == 0) [[unlikely]] {
+                return;
+            }
+
+            {
+                const std::size_t consumed = avail;
+                ptr += consumed;
+                frame.payload_length += consumed;
+                avail -= consumed;
+
+                if (frame.payload_length == frame.length) {
+                    if (frame.flags & Flags::END_STREAM) {
+                        strm.state = StreamStates::HalfClosedRemote;
+                    }
+
+                    on(*this, frame.stream_id, strm,
+                       views::data_type(std::move(frame)));
+                    frame.clear();
+                    __pstatus = __Start;
+                }
+            }
+        }
+    }
+
+    void feed_header(frame_type& frame, const unsigned char*& ptr,
+                     const unsigned char* end) {
+        auto ite = __M_strms.find(frame.stream_id);
+        assert(ite != __M_strms.end());
+        h2_stream& strm = ite->second;
+
+        const unsigned char* begin = ptr;
+        std::size_t avail = std::min(frame.length - frame.payload_length,
+                                     static_cast<length_type>(end - begin));
+        if (avail == 0) {
+            return;
+        }
+        if (!(frame.flags & Flags::PADDED)) {
+            // no padded
+            const std::size_t payload_begin =
+                (frame.flags & Flags::PRIORITY) ? 5 : 0;
+
+            // consume priority
+            if (frame.payload_length < payload_begin) {
+                std::size_t consumed =
+                    std::min(avail, payload_begin - frame.payload_length);
+                frame.payload_length += consumed;
+                ptr += consumed;
+                avail -= consumed;
+            }
+            if (avail == 0) [[unlikely]] {
+                return;
+            }
+
+            bool is_end = (frame.payload_length + avail == frame.length &&
+                           frame.flags & Flags::END_HEADERS);
+            hpack().decode_block(ptr, avail, is_end, strm.fields);
+            ptr += avail;
+            frame.payload_length += avail;
+            if (frame.payload_length == frame.length && is_end) {
+                data_fsm.next_header_strm = 0;
+
+                if (frame.flags & Flags::END_STREAM) {
                     assert(strm.state == StreamStates::Open);
                     strm.state = StreamStates::HalfClosedRemote;
                 }
                 on(*this, frame.stream_id, strm,
-                   views::data_type(std::move(frame)));
+                   views::headers_type{std::move(frame),
+                                       std::move(strm.fields)});
+                strm.fields.clear();
                 frame.clear();
-
                 __pstatus = __Start;
-                data_fsm.status = DataFrameStatus::DATA_PAD;
             }
         } else {
-            while (ptr < tail) {
-                switch (data_fsm.status) {
-                case DataFrameStatus::DATA_PAD: {
-                    assert(frame.payload_length == 0);
-                    const std::uint8_t padded_length = *(ptr++);
-                    if (padded_length + 1 > frame.length ||
-                        padded_length == 0) {
-                        __CHXHTTP_H2RT_THROW(
-                            make_ec(ErrorCodes::PROTOCOL_ERROR));
-                    }
-                    data_fsm.padded_length = padded_length;
-                    ++frame.payload_length;
-                    data_fsm.status = DataFrameStatus::DATA_BODY;
-                    break;
-                }
-                case DataFrameStatus::DATA_BODY: {
-                    const std::size_t body_end =
-                        frame.length - data_fsm.padded_length;
-                    assert(frame.payload_length + data_fsm.padded_length <=
-                           frame.length);
-                    const std::size_t body_remain = frame.length -
-                                                    frame.payload_length -
-                                                    data_fsm.padded_length;
-                    const std::size_t consumed = std::min(
-                        static_cast<std::size_t>(tail - ptr), body_remain);
-                    on(*this, frame.stream_id, strm, data_frame_block{}, ptr,
-                       ptr + consumed);
+            // padded
+            if (frame.payload_length == 0) {
+                data_fsm.padded_length = *(ptr++);
+                ++frame.payload_length;
+                --avail;
+            }
+            if (avail == 0) [[unlikely]] {
+                return;
+            }
 
-                    frame.payload_length += consumed;
-                    ptr += consumed;
-                    assert(frame.payload_length <= body_end);
-                    if (frame.payload_length == body_end) {
-                        data_fsm.status = DataFrameStatus::DATA_TAIL;
-                    }
-                    break;
-                }
-                case DataFrameStatus::DATA_TAIL: {
-                    const std::size_t remain_padded =
-                        frame.length - frame.payload_length;
-                    const std::size_t consumed = std::min(
-                        static_cast<std::size_t>(tail - ptr), remain_padded);
+            const std::size_t payload_begin =
+                (frame.flags & Flags::PRIORITY) ? 6 : 1;
+            const std::size_t payload_end =
+                frame.length - data_fsm.padded_length;
 
-                    frame.payload_length += consumed;
-                    ptr += consumed;
+            // consume head
+            if (frame.payload_length < payload_begin) {
+                const std::size_t consumed =
+                    std::min(avail, payload_begin - frame.payload_length);
+                frame.payload_length += consumed;
+                ptr += consumed;
+                avail -= consumed;
+            }
+            if (avail == 0) [[unlikely]] {
+                return;
+            }
 
-                    assert(frame.payload_length <= frame.length);
-                    if (frame.length == frame.payload_length) {
-                        assert(ptr == tail);
+            // consume real data
+            if (frame.payload_length < payload_end) {
+                const std::size_t consumed =
+                    std::min(avail, payload_end - frame.payload_length);
+                bool is_end = (frame.payload_length + consumed == payload_end &&
+                               frame.flags & Flags::END_HEADERS);
+                hpack().decode_block(ptr, consumed, is_end, strm.fields);
+                ptr += consumed;
+                frame.payload_length += consumed;
+                avail -= consumed;
+            }
+            if (avail == 0) [[unlikely]] {
+                return;
+            }
+
+            // consume padded
+            {
+                const std::size_t consumed =
+                    std::min(avail, static_cast<std::size_t>(
+                                        frame.length - frame.payload_length));
+                ptr += consumed;
+                frame.payload_length += consumed;
+                avail -= consumed;
+                if (frame.payload_length == frame.length) {
+                    assert(avail == 0);
+                    if (frame.flags & Flags::END_HEADERS) {
+                        data_fsm.next_header_strm = 0;
+
                         if (frame.flags & Flags::END_STREAM) {
                             assert(strm.state == StreamStates::Open);
                             strm.state = StreamStates::HalfClosedRemote;
                         }
-
                         on(*this, frame.stream_id, strm,
-                           views::data_type(std::move(frame)));
+                           views::headers_type{std::move(frame),
+                                               std::move(strm.fields)});
+                        strm.fields.clear();
                         frame.clear();
-
-                        data_fsm.status = DataFrameStatus::DATA_PAD;
                         __pstatus = __Start;
                     }
-                    break;
-                }
                 }
             }
         }
@@ -686,7 +783,6 @@ class h2_impl : HPackImpl {
         if (!can_read()) [[unlikely]] {
             return;
         }
-        assert(frame_parse.type != FrameType::DATA);
         if (frame_parse.length != frame_parse.payload.size() ||
             frame_parse.length != frame_parse.payload_length) [[unlikely]] {
             __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
@@ -694,9 +790,6 @@ class h2_impl : HPackImpl {
         switch (frame_parse.type) {
         case FrameType::CONTINUATION: {
             return process_CONTINUATION();
-        }
-        case FrameType::HEADERS: {
-            return process_HEADER();
         }
         case FrameType::PRIORITY: {
             return process_PRIORITY();
@@ -753,67 +846,6 @@ class h2_impl : HPackImpl {
             return;
         }
         // lifecycle, but continuation only has END_HEADERS flag
-    }
-    void process_HEADER() {
-        if (headers_frame_header_check(frame_parse) != ErrorCodes::NO_ERROR)
-            [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-        }
-        if ((frame_parse.flags & Flags::END_STREAM) &&
-            !(frame_parse.flags & Flags::END_HEADERS)) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-        }
-        auto ite = __M_strms.find(frame_parse.stream_id);
-        // idle -> open
-        if (ite == __M_strms.end()) {
-            h2_stream& strm =
-                __M_strms.emplace(frame_parse.stream_id, h2_stream{})
-                    .first->second;
-            strm.client_window = conn_settings.initial_window_size;
-            strm.server_window = conn_settings.initial_window_size;
-            if (!(frame_parse.flags & Flags::END_STREAM)) {
-                strm.state = StreamStates::Open;
-            } else {
-                strm.state = StreamStates::HalfClosedRemote;
-            }
-            if (frame_parse.flags & Flags::END_HEADERS) {
-                // decode and invoke header
-                fields_type fields;
-                auto [pos, len] = headers_frame_get_payload(frame_parse);
-                hpack().decode(frame_parse.payload.data() + pos, len, fields);
-                on(*this, frame_parse.stream_id, strm.userdata(),
-                   views::headers_type(std::move(frame_parse),
-                                       std::move(fields)));
-            } else {
-                strm.field_blocks.emplace_back(std::move(frame_parse));
-            }
-        } else {
-            h2_stream& strm = ite->second;
-            // life cycle
-            if (frame_parse.flags & Flags::END_STREAM) {
-                // open -> half-closed remote, or half-closed local to closed
-                // stream should never be half-closed local, because chxhttp
-                // would never send ES on open: every message should be finished
-                // with ES
-                if (!(frame_parse.flags & Flags::END_HEADERS)) {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-                }
-                assert(strm.state == StreamStates::Open);
-                strm.state = StreamStates::HalfClosedRemote;
-            }
-            if (frame_parse.flags & Flags::END_HEADERS) {
-                // invoke header
-                fields_type fields;
-                auto [pos, len] = headers_frame_get_payload(frame_parse);
-                hpack().decode(frame_parse.payload.data() + pos, len, fields);
-                on(*this, ite->first, strm.userdata(),
-                   views::headers_type(std::move(frame_parse),
-                                       std::move(fields)));
-            } else {
-                strm.field_blocks.emplace_back(std::move(frame_parse));
-            }
-        }
-        return;
     }
     void process_PRIORITY() { return; }
     void process_RST_STREAM() {
@@ -901,14 +933,15 @@ class h2_impl : HPackImpl {
         return;
     }
 
-    constexpr bool
-    frame_check_before_payload_must_be_CONTINUATION(const h2_stream& strm) {
-        return !strm.field_blocks.empty();
-    }
-    constexpr bool frame_check_before_payload_no_prev(const h2_stream& strm) {
-        return strm.field_blocks.empty();
-    }
     void frame_check_before_payload(const http::h2::frame_type& frame) {
+        if (data_fsm.next_header_strm != 0) [[unlikely]] {
+            if (frame.type != FrameType::CONTINUATION) [[unlikely]] {
+                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
+            }
+            if (frame.stream_id != data_fsm.next_header_strm) [[unlikely]] {
+                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
+            }
+        }
         if (frame.length > conn_settings.max_frame_size) [[unlikely]] {
             __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FRAME_SIZE_ERROR));
         }
@@ -918,19 +951,14 @@ class h2_impl : HPackImpl {
         */
         switch (frame.type) {
         case FrameType::CONTINUATION: {
+            if (data_fsm.next_header_strm != frame.stream_id) [[unlikely]] {
+                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
+            }
             if (auto ite = __M_strms.find(frame.stream_id);
                 ite != __M_strms.end()) {
                 h2_stream& strm = ite->second;
                 // check strm state
-                if (!strm.template state_any_of<
-                        StreamStates::ReservedLocal, StreamStates::Open,
-                        StreamStates::HalfClosedRemote>()) [[unlikely]] {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-                }
-                // check prev frame
-                if (frame_check_before_payload_must_be_CONTINUATION(strm)) {
-                    return;
-                } else {
+                if (strm.state != StreamStates::Open) [[unlikely]] {
                     __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
                 }
             } else {
@@ -956,18 +984,12 @@ class h2_impl : HPackImpl {
                     client_conn_window -= frame.length;
                     strm.client_window -= frame.length;
                 }
-                printf("remain window %d %d\n", client_conn_window,
-                       strm.client_window);
                 if (client_conn_window == 0) {
                     create_WINDOW_UPDATE_frame(0, 65535);
                 }
                 if (strm.client_window == 0) {
                     create_WINDOW_UPDATE_frame(
                         frame.stream_id, conn_settings.initial_window_size);
-                }
-                // check prev frame
-                if (!frame_check_before_payload_no_prev(strm)) [[unlikely]] {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
                 }
                 // check strm state
                 if (strm.state == StreamStates::Open) {
@@ -989,10 +1011,6 @@ class h2_impl : HPackImpl {
                 ite != __M_strms.end()) {
                 // non-idle
                 h2_stream& strm = ite->second;
-                // check prev frame
-                if (!frame_check_before_payload_no_prev(strm)) [[unlikely]] {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-                }
                 // check strm state
                 if (strm.state != StreamStates::Open) {
                     return;
@@ -1001,11 +1019,11 @@ class h2_impl : HPackImpl {
                 }
             } else {
                 // idle
-                if (client_new_strm_id_must_be_valid(frame.stream_id)) {
-                    return;
-                } else {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-                }
+                h2_stream& strm =
+                    __M_strms.emplace(frame.stream_id, h2_stream{})
+                        .first->second;
+                strm.client_window = conn_settings.initial_window_size;
+                strm.server_window = conn_settings.initial_window_size;
             }
         }
         case FrameType::PRIORITY: {
@@ -1018,16 +1036,6 @@ class h2_impl : HPackImpl {
             }
             if (frame.length != 0x04) [[unlikely]] {
                 __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FRAME_SIZE_ERROR));
-            }
-            if (auto ite = __M_strms.find(frame.stream_id);
-                ite != __M_strms.end()) {
-                if (frame_check_before_payload_no_prev(ite->second)) {
-                    return;
-                } else {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-                }
-            } else {
-                return;
             }
         }
         case FrameType::SETTINGS: {
@@ -1075,12 +1083,7 @@ class h2_impl : HPackImpl {
                 }
                 if (auto ite = __M_strms.find(frame.stream_id);
                     ite != __M_strms.end()) {
-                    if (frame_check_before_payload_no_prev(ite->second)) {
-                        return;
-                    } else {
-                        __CHXHTTP_H2RT_THROW(
-                            make_ec(ErrorCodes::PROTOCOL_ERROR));
-                    }
+                    return;
                 } else {
                     /**
                       rfc9113: This means that a receiver could receive a
@@ -1193,7 +1196,7 @@ class h2_impl : HPackImpl {
         if (!io_cntl.goaway_sent()) {
             return *this;
         } else {
-            throw connection_closed();
+            throw session_closed();
         }
     }
     constexpr bool get_guard() noexcept(true) { return !io_cntl.goaway_sent(); }

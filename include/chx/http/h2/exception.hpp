@@ -17,11 +17,6 @@ class runtime_exception : public net::exception {
         return __M_ec;
     }
 };
-
-class connection_closed : public net::exception {
-  public:
-    using exception::exception;
-};
 }  // namespace chx::http::h2
 
 #define __CHXHTTP_H2RT_THROW(ec)                                               \

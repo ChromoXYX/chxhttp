@@ -7,9 +7,9 @@ std::string etag(const struct timespec& ts) {
                             ts.tv_nsec);
 }
 
-bool if_none_match(const chx::http::request_type& req,
+bool if_none_match(const chx::http::fields_type& fields,
                    std::string_view true_tag) {
-    if (auto ite = req.fields.find("if-none-match"); ite != req.fields.end()) {
+    if (auto ite = fields.find("if-none-match"); ite != fields.end()) {
         std::string_view sv = ite->second;
         if (sv != "*") {
             while (!sv.empty()) {
