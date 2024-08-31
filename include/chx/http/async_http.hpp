@@ -31,6 +31,11 @@ struct operation : CHXNET_NONCOPYABLE,
     struct internal_write_final {};
     struct internal_timeout {};
 
+    void unhandled_exception(cntl_type& cntl, std::exception_ptr) {
+        terminate_now();
+        cntl.complete(std::error_code{});
+    }
+
     template <typename Str, typename Ses, typename Tmr>
     operation(Str&& str, Ses&& ses, Tmr& tmr)
         : __M_nstream(std::forward<Str>(str)),
@@ -71,11 +76,15 @@ struct operation : CHXNET_NONCOPYABLE,
     void operator()(Cntl& cntl, const std::error_code& e, std::size_t s,
                     internal_read) {
         io_cntl.unset_recving();
-        if (!e || e == net::errc::operation_canceled) {
+        if (!e) {
             if (io_cntl.want_recv()) {
                 feed2(__M_inbuf.data(), s);
                 do_read();
             }
+        } else if (e == net::errc::eof) {
+            __M_tmr_controller.emit();
+            __M_tmr_controller.clear();
+            io_cntl.shutdown_recv();
         } else {
             // network failure, mostly eof
             terminate_now();
@@ -232,11 +241,13 @@ struct operation : CHXNET_NONCOPYABLE,
             throw session_closed();
         }
     }
-    constexpr bool get_guard() noexcept(true) { return !io_cntl.goaway_sent(); }
+    constexpr bool get_guard() noexcept(true) {
+        return !io_cntl.goaway_sent() && io_cntl.want_send();
+    }
 
     template <typename... Ts>
     void response(status_code code, fields_type fields, Ts&&... ts) {
-        if (!io_cntl.goaway_sent()) {
+        if (get_guard()) {
             if (code == status_code::Bad_Request ||
                 static_cast<unsigned short>(code) >= 500) {
                 io_cntl.send_goaway();
@@ -502,18 +513,9 @@ struct operation : CHXNET_NONCOPYABLE,
                 auto& cntl = __M_p.get()->cntl();
                 net::co_spawn(
                     cntl.get_associated_io_context(),
-                    [](net::future<> f, operation* oper) -> net::task {
-                        try {
-                            co_return co_await f;
-                        } catch (const session_closed&) {
-                        } catch (const std::exception& e) {
-                            std::string data = e.what();
-                            fields_type fields;
-                            fields["server"] = "chxhttp";
-                            oper->response(status_code::Internal_Server_Error,
-                                           std::move(fields), std::move(data));
-                        }
-                    }(std::move(future), __M_p.get()),
+                    [](net::future<> f) -> net::task {
+                        co_return co_await f;
+                    }(std::move(future)),
                     [&cntl](const std::error_code& e) { cntl.complete(e); });
             }
         }
@@ -529,6 +531,9 @@ struct operation : CHXNET_NONCOPYABLE,
                  std::string_view payload) {
             __response(code, std::move(fields), std::move(payload));
         }
+        void end(status_code code, fields_type&& fields, std::string payload) {
+            __response(code, std::move(fields), std::move(payload));
+        }
         void end(status_code code, fields_type&& fields,
                  std::vector<unsigned char> payload) {
             __response(code, std::move(fields), std::move(payload));
@@ -537,6 +542,10 @@ struct operation : CHXNET_NONCOPYABLE,
                  net::mapped_file mapped, std::size_t len, std::size_t offset) {
             __response(code, std::move(fields),
                        net::carrier{std::move(mapped), offset, len});
+        }
+
+        const net::ip::tcp::socket& socket() const noexcept(true) override {
+            return __M_p->stream();
         }
 
       private:

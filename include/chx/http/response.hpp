@@ -4,6 +4,7 @@
 #include "./header.hpp"
 #include "./session_closed.hpp"
 
+#include <chx/net/tcp.hpp>
 #include <chx/net/coroutine2.hpp>
 #include <chx/net/utility.hpp>
 
@@ -24,11 +25,15 @@ class response {
     virtual void end(status_code code, fields_type&& fields,
                      std::string_view payload) = 0;
     virtual void end(status_code code, fields_type&& fields,
+                     std::string payload) = 0;
+    virtual void end(status_code code, fields_type&& fields,
                      std::vector<unsigned char> payload) = 0;
     virtual void end(status_code code, fields_type&& fields,
                      net::mapped_file mapped, std::size_t len,
                      std::size_t offset = 0) = 0;
 
     virtual void co_spawn(net::future<>&& future) const = 0;
+
+    virtual const net::ip::tcp::socket& socket() const noexcept(true) = 0;
 };
 }  // namespace chx::http
