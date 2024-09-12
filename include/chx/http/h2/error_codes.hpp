@@ -17,7 +17,9 @@ enum [[nodiscard]] ErrorCodes : unsigned int {
     CONNECT_ERROR = 0x0a,
     ENHANCE_YOUR_CALM = 0x0b,
     INADEQUATE_SECURITY = 0x0c,
-    HTTP_1_1_REQUIRED = 0x0d
+    HTTP_1_1_REQUIRED = 0x0d,
+
+    NOT_H2 = 0xffffffff
 };
 
 inline std::error_code make_ec(ErrorCodes code) noexcept(true) {

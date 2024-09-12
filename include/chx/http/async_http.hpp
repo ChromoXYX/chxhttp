@@ -31,11 +31,6 @@ struct operation : CHXNET_NONCOPYABLE,
     struct internal_write_final {};
     struct internal_timeout {};
 
-    void unhandled_exception(cntl_type& cntl, std::exception_ptr) {
-        terminate_now();
-        cntl.complete(std::error_code{});
-    }
-
     template <typename Str, typename Ses, typename Tmr>
     operation(Str&& str, Ses&& ses, Tmr& tmr)
         : __M_nstream(std::forward<Str>(str)),
@@ -81,10 +76,8 @@ struct operation : CHXNET_NONCOPYABLE,
                 feed2(__M_inbuf.data(), s);
                 do_read();
             }
-        } else if (e == net::errc::eof) {
-            __M_tmr_controller.emit();
-            __M_tmr_controller.clear();
-            io_cntl.shutdown_recv();
+        } else if (e == net::errc::eof || e == net::errc::io_error) {
+            shutdown_recv();
         } else {
             // network failure, mostly eof
             terminate_now();
@@ -131,10 +124,8 @@ struct operation : CHXNET_NONCOPYABLE,
 
     template <typename Cntl>
     void operator()(Cntl& cntl, const std::error_code& e, internal_timeout) {
-        if (!e || e != net::errc::operation_canceled) {
-            io_cntl.shutdown_recv();
-            __M_tmr_controller.clear();
-            cancel_all();
+        if (!e) {
+            shutdown_recv();
         }
         cntl.complete(e);
     }
@@ -251,7 +242,7 @@ struct operation : CHXNET_NONCOPYABLE,
             if (code == status_code::Bad_Request ||
                 static_cast<unsigned short>(code) >= 500) {
                 io_cntl.send_goaway();
-                io_cntl.shutdown_recv();
+                shutdown_recv();
             }
 
             // content length
@@ -275,19 +266,13 @@ struct operation : CHXNET_NONCOPYABLE,
         }
     }
 
-    // h11_shutdown_recv and h11_shutdown_both shall not be invoked out of
-    // async_combine::operator() scope!
-    constexpr void h11_shutdown_recv() noexcept(true) {
-        io_cntl.shutdown_recv();
-    }
-
     constexpr bool h11_would_close() noexcept(true) {
         return !io_cntl.want_recv();
     }
 
     void terminate_now() {
-        io_cntl.shutdown_both();
-        __M_tmr_controller.clear();
+        shutdown_both();
+        io_cntl.send_goaway();
         cancel_all();
     }
 
@@ -314,9 +299,12 @@ struct operation : CHXNET_NONCOPYABLE,
                     self->__M_parse_state.current_max) {
                     self->__M_parse_state.current_size += s;
                     try {
-                        on<data_block>(self->session(), self->__M_request,
-                                       response_impl(self), p, p + s);
+                        on<data_block>(
+                            self->session(),
+                            const_cast<const request_type&>(self->__M_request),
+                            response_impl(self), p, p + s);
                     } catch (const std::exception& ex) {
+                        self->shutdown_recv();
                         return HPE_USER;
                     }
                 } else {
@@ -368,6 +356,7 @@ struct operation : CHXNET_NONCOPYABLE,
                         const_cast<const request_type&>(self->__M_request),
                         response_impl(self));
                 } catch (const std::exception& ex) {
+                    self->shutdown_recv();
                     return HPE_PAUSED;
                 }
                 return !self->io_cntl.goaway_sent() ? HPE_OK : HPE_PAUSED;
@@ -377,13 +366,14 @@ struct operation : CHXNET_NONCOPYABLE,
                 self->__M_parse_state.current_size = 0;
                 try {
                     if (!llhttp_should_keep_alive(c)) {
-                        self->h11_shutdown_recv();
+                        self->shutdown_recv();
                     }
                     self->update_timeout(std::chrono::seconds(0));
                     on<message_complete>(self->session(), self->__M_request,
                                          response_impl(self));
                     self->__M_request = {};
                 } catch (const std::exception& ex) {
+                    self->shutdown_recv();
                     return HPE_PAUSED;
                 }
                 return !self->io_cntl.goaway_sent() ? HPE_OK : HPE_PAUSED;
@@ -402,22 +392,10 @@ struct operation : CHXNET_NONCOPYABLE,
     llhttp_t __M_parser;
 
     struct {
-        // whether server want to recv or process next frame
         constexpr bool want_recv() const noexcept(true) { return v & 1; }
-        // whether server CAN send any frame
         constexpr bool want_send() const noexcept(true) { return v & 2; }
-        // whether is an outstanding send task
         constexpr bool is_sending() const noexcept(true) { return v & 4; }
-        // whether there is an outstanding recv task
         constexpr bool is_recving() const noexcept(true) { return v & 8; }
-
-        // to make server unable to process any frame or send any frame
-        constexpr void shutdown_both() noexcept(true) {
-            shutdown_recv();
-            shutdown_send();
-        }
-        constexpr void shutdown_recv() noexcept(true) { v &= ~1; }
-        constexpr void shutdown_send() noexcept(true) { v &= ~2; }
 
         constexpr void set_sending() noexcept(true) { v |= 4; }
         constexpr void unset_sending() noexcept(true) { v &= ~4; }
@@ -428,9 +406,33 @@ struct operation : CHXNET_NONCOPYABLE,
         constexpr void send_goaway() noexcept(true) { v |= 16; }
         constexpr bool goaway_sent() noexcept(true) { return v & 16; }
 
+        constexpr void shutdown_both() noexcept(true) {
+            shutdown_recv();
+            shutdown_send();
+        }
+        constexpr void shutdown_recv() noexcept(true) { v &= ~1; }
+        constexpr void shutdown_send() noexcept(true) { v &= ~2; }
+
       private:
         char v = 1 | 2;
     } io_cntl;
+    void shutdown_recv() noexcept(true) {
+        std::error_code e;
+        stream().shutdown(stream().shutdown_receive, e);
+        __M_tmr_controller.emit();
+        io_cntl.shutdown_recv();
+    }
+    void shutdown_send() noexcept(true) {
+        std::error_code e;
+        stream().shutdown(stream().shutdown_write, e);
+        io_cntl.shutdown_send();
+    }
+    void shutdown_both() noexcept(true) {
+        std::error_code e;
+        stream().shutdown(stream().shutdown_both, e);
+        __M_tmr_controller.emit();
+        io_cntl.shutdown_both();
+    }
 
     void do_read() {
         if (can_read()) {
@@ -516,7 +518,9 @@ struct operation : CHXNET_NONCOPYABLE,
                     [](net::future<> f) -> net::task {
                         co_return co_await f;
                     }(std::move(future)),
-                    [&cntl](const std::error_code& e) { cntl.complete(e); });
+                    cntl.next_then([&cntl](const std::error_code& e) {
+                        cntl.complete(e);
+                    }));
             }
         }
 

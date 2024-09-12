@@ -1,291 +1,269 @@
 #pragma once
 
-#include <algorithm>
-#include <chrono>
-#include <chx/net/io_context.hpp>
-#include <chx/net/async_write_sequence_exactly.hpp>
-#include <chx/net/utility.hpp>
-#include <chx/net/iovec_buffer.hpp>
-#include <map>
-#include <array>
-#include <numeric>
-#include <queue>
-#include <set>
+// a brand new http/2 impl. support http server side semantics ONLY
 
-#include "../session_closed.hpp"
-#include "../detail/payload.hpp"
-#include "./exception.hpp"
-#include "./types.hpp"
-#include "./frame_type.hpp"
+// any error issued by chxhttp.h2 should be connection error.
+
+#include "./detail/parser.hpp"
+#include "./detail/types.hpp"
 #include "./error_codes.hpp"
-#include "./settings.hpp"
-#include "./detail/copy_integer.hpp"
-#include "../events.hpp"
+#include "./events.hpp"
+#include "../header.hpp"
+#include "../detail/payload.hpp"
+#include "./detail/stream_states.hpp"
+#include "./detail/data_task.hpp"
+#include "./detail/h2_stream.hpp"
+#include "./detail/frame.hpp"
+#include "../status_code.hpp"
 
-namespace chx::http::h2::detail::tags {
-struct http2_impl {};
-}  // namespace chx::http::h2::detail::tags
+#include <array>
+#include <chrono>
+#include <chx/net/detail/tracker.hpp>
+#include <chx/net/async_write_sequence_exactly.hpp>
+#include <chx/net/detail/remove_rvalue_reference.hpp>
+#include <chx/net/basic_fixed_timer.hpp>
+#include <variant>
+#include <map>
+
+namespace chx::http::h2 {
+template <typename SessionFactory> struct connection;
+}
 
 namespace chx::http::h2::detail {
-template <typename Stream, typename Session, typename HPackImpl,
-          typename FixedTimerRef, typename CntlType = int>
-class h2_impl : HPackImpl {
-  public:
-    template <typename T>
-    using rebind = h2_impl<Stream, Session, HPackImpl, FixedTimerRef, T>;
-    using cntl_type = CntlType;
-    using stream_type = Stream;
-    using session_type = Session;
-    using session_stream_userdata_type = typename Session::stream_userdata_type;
-    using Flags = http::h2::frame_type::Flags;
+template <typename T> struct visitor;
 
-    struct ev_send {};
-    struct ev_send_final {};
-    struct ev_recv {};
-    struct ev_preface {};
-    struct ev_ack_timeout {};
-    struct ev_watchdog {};
+template <typename Stream, typename Connection, typename HPackImpl,
+          typename FixedTimer, typename CntlType = int>
+struct operation {
+    template <typename T> friend struct visitor;
+    template <typename T> friend struct h2::connection;
 
-    template <typename Strm, typename HPack>
-    h2_impl(Strm&& strm, std::unique_ptr<Session> p, HPack&& h,
-            FixedTimerRef& ftr)
-        : HPackImpl(std::forward<HPack>(h)),
-          __M_stream(std::forward<Strm>(strm)), __M_session(std::move(p)),
-          __M_fixed_timer(ftr) {}
-
-    constexpr cntl_type& cntl() noexcept(true) {
-        return static_cast<cntl_type&>(*this);
-    }
-    constexpr stream_type& stream() noexcept(true) { return __M_stream; }
-    constexpr session_type& session() noexcept(true) { return *__M_session; }
-
-    void operator()(cntl_type& cntl) {
-        do_watchdog();
-        __M_inbuf.resize(4096);
-        // #1 client connection preface
-        io_cntl.set_recving();
-        stream().lowest_layer().async_read_some(
-            net::buffer(__M_inbuf), cntl.template next_with_tag<ev_preface>());
-        // #2 server connection preface
-        struct static_preface_vec {
-            std::vector<views::settings_type::setting_type> v;
-
-            static_preface_vec() : v(3) {
-                v[0].identifier(Settings::SETTINGS_NO_RFC7540_PRIORITIES);
-                v[0].value(1);
-                v[1].identifier(Settings::SETTINGS_MAX_FRAME_SIZE);
-                v[1].value(16384);
-                v[2].identifier(Settings::SETTINGS_MAX_CONCURRENT_STREAMS);
-                v[2].value(100);
-            }
-        } static preface_vec = {};
-        try {
-            create_SETTINGS_frame(preface_vec.v);
-            do_send();
-        } catch (const runtime_exception& ex) {
-            std::terminate();
+  private:
+    template <typename Event, typename T, typename... Args>
+    ErrorCodes on(T&& t, Args&&... args) {
+        if constexpr (std::is_invocable_v<T&&, Event, Args&&...>) {
+            return std::forward<T>(t)(Event(), std::forward<Args>(args)...);
+        } else {
+            return ErrorCodes::NO_ERROR;
         }
     }
 
+    using cntl_type = CntlType;
+    using session_type = typename Connection::session_type;
+    using h2_strm = h2_stream<session_type>;
+
+    struct ev_send {};
+    struct ev_send_final {};
+
+    struct ev_read {};
+
+    struct ev_settings_timeout {};
+    struct ev_keepalive_timeout {};
+
+    enum Stage {
+        LengthStage = 0,
+        TypeStage = 1,
+        FlagsStage = 2,
+        StreamIdStage = 3,
+        DataPaddingStage = 4,
+        DataBodyStage = 5,
+        DataTail = 6,
+        HeaderPaddingStage = 7,
+        HeaderPriorityStage = 8,
+        HeaderBodyStage = 9,
+        HeaderTail = 10,
+        PriorityStage = 11,
+        RstStage = 12,
+        SettingsKeyStage = 13,
+        SettingsValStage = 14,
+        PingStage = 15,
+        GoAwayStrmIdStage = 16,
+        GoAwayErrorCodeStage = 17,
+        GoAwayDebugStage = 18,
+        WndUpdateStage = 19,
+        ContinuationStage = 20,
+
+        PrefacePRIStage = 21,
+        PrefaceLengthStage = 22,
+        PrefaceTypeStage = 23,
+        PrefaceFlagsStage = 24,
+        PrefaceStreamIdStage = 25
+    };
+
+  public:
+    template <typename T>
+    using rebind = operation<Stream, Connection, HPackImpl, FixedTimer, T>;
+
+    template <typename Strm, typename Conn, typename H, typename FixedTmr>
+    operation(Strm&& strm, Conn&& conn, H&& h, FixedTmr& tmr)
+        : __M_stream(std::forward<Strm>(strm)),
+          __M_session(std::forward<Conn>(conn)), __M_hpack(std::forward<H>(h)),
+          __M_tmr(tmr) {}
+
+    void operator()(cntl_type& cntl) {
+        __M_buf.resize(4096);
+        __M_state.template emplace<PrefacePRIStage>();
+        __M_stream.lowest_layer().async_read_some(
+            net::buffer(__M_buf), cntl.template next_with_tag<ev_read>());
+        __M_tmr.async_register(
+            std::chrono::seconds(30),
+            net::bind_cancellation_signal(
+                keepalive_timeout,
+                cntl.template next_with_tag<ev_keepalive_timeout>()));
+    }
+
     void operator()(cntl_type& cntl, const std::error_code& e, std::size_t s,
-                    ev_preface) {
-        io_cntl.unset_recving();
-        if (!e && can_read()) {
-            // client_largest_id -> offset of preface,
-            // 24 - client_largest_id -> remain sz
-            if (s >= 24 - client_largest_id) {
-                if (std::equal(__M_inbuf.begin(),
-                               __M_inbuf.begin() + 24 - client_largest_id,
-                               &impl_detail::client_connection_preface_cstr
-                                   [client_largest_id])) {
-                    int offset = client_largest_id;
-                    client_largest_id = 0;
-                    try {
-                        feed2(__M_inbuf.data() + 24 - offset,
-                              __M_inbuf.data() + s);
-                    } catch (const runtime_exception& ex) {
-                        terminate_now(ex.get_error_code());
-                    } catch (const std::exception& ex) {
-                        terminate_now();
-                        cntl.complete(std::error_code{});
-                        std::rethrow_exception(std::current_exception());
-                    }
-                    do_read();
-                    do_send();
-                }
-                return cntl.complete(e);
-            } else {
-                if (std::equal(__M_inbuf.begin(), __M_inbuf.begin() + s,
-                               &impl_detail::client_connection_preface_cstr
-                                   [client_largest_id])) {
-                    client_largest_id += s;
-                    io_cntl.set_recving();
-                    stream().lowest_layer().async_read_some(
-                        net::buffer(__M_inbuf),
-                        cntl.template next_with_tag<ev_preface>());
-                } else {
+                    ev_read) {
+        try {
+            if (!e) {
+                if (ErrorCodes r = feed(__M_buf.data(), __M_buf.data() + s);
+                    r == ErrorCodes::NO_ERROR && io_cntl.want_recv()) {
+                    update_keepalive(std::chrono::seconds(30));
+                    __M_stream.lowest_layer().async_read_some(
+                        net::buffer(__M_buf),
+                        cntl.template next_with_tag<ev_read>());
                     return cntl.complete(e);
                 }
             }
-        } else {
-            terminate_now(ErrorCodes::INTERNAL_ERROR);
+            shutdown_recv();
+            return complete_with_goaway(e);
+        } catch (const std::exception& ex) {
+            terminate_now();
             cntl.complete(e);
+            std::rethrow_exception(std::current_exception());
         }
     }
 
     void operator()(cntl_type& cntl, const std::error_code& e, std::size_t s,
                     ev_send) {
-        io_cntl.unset_sending();
-        if (!e) {
-            if (!io_cntl.goaway_sent()) {
-                do_send();
-            } else {
-                cancel_all();
-                if (can_send()) {
+        try {
+            io_cntl.unset_sending();
+            update_keepalive(std::chrono::seconds(30));
+            if (!e) {
+                if (!io_cntl.goaway_sent()) {
+                    do_send();
+                } else if (can_send()) {
+                    assert(!keepalive_timeout && !io_cntl.want_recv());
                     io_cntl.set_sending();
-                    net::async_write_sequence_exactly(
-                        stream().lowest_layer(), std::move(pending_frames),
+                    return net::async_write_sequence_exactly(
+                        __M_stream.lowest_layer(), std::move(pending_frames),
                         cntl.template next_with_tag<ev_send_final>());
                 }
+                return complete_with_goaway(e);
+            } else {
+                terminate_now();
+                return cntl.complete(e);
             }
-        } else {
+        } catch (const std::exception& ex) {
             terminate_now();
+            cntl.complete(e);
+            std::rethrow_exception(std::current_exception());
         }
-        cntl.complete(e);
     }
     void operator()(cntl_type& cntl, const std::error_code& e, std::size_t s,
                     ev_send_final) {
-        io_cntl.unset_sending();
-        if (e) {
-            terminate_now();
-        }
-        cntl.complete(e);
-    }
-    void operator()(cntl_type& cntl, const std::error_code& e, std::size_t s,
-                    ev_recv) {
-        io_cntl.unset_recving();
-        if (!e || e == net::errc::operation_canceled) {
-            printf("read %lu\n", s);
-            try {
-                feed2(__M_inbuf.data(), __M_inbuf.data() + s);
-            } catch (const runtime_exception& ex) {
-                terminate_now(ex.get_error_code());
-            } catch (const std::exception& ex) {
+        try {
+            io_cntl.unset_sending();
+            if (!e) {
+                complete_with_goaway(e);
+            } else {
                 terminate_now();
-                cntl.complete(std::error_code{});
-                std::rethrow_exception(std::current_exception());
+                return cntl.complete(e);
             }
-            do_read();
-            do_send();
-        } else {
-            // network failure
+        } catch (const std::exception& ex) {
             terminate_now();
+            cntl.complete(e);
+            std::rethrow_exception(std::current_exception());
         }
-        cntl.complete(e);
     }
 
-    void operator()(cntl_type& cntl, const std::error_code& e, ev_watchdog) {
+    void operator()(cntl_type& cntl, const std::error_code& e,
+                    ev_keepalive_timeout) {
+        keepalive_timeout.clear();
         if (!e) {
-            if (!(watchdog_settings_ack_deadline.time_since_epoch().count() !=
-                      0 &&
-                  std::chrono::system_clock::now() >
-                      watchdog_settings_ack_deadline)) {
-                do_watchdog();
-            } else {
-                terminate_now(ErrorCodes::SETTINGS_TIMEOUT);
-            }
-        } else if (e != net::errc::operation_canceled) {
-            // chxnet failure
-            terminate_now();
+            shutdown_recv();
         }
-        cntl.complete(e);
+        return complete_with_goaway(e);
+    }
+
+    void operator()(cntl_type& cntl, const std::error_code& e,
+                    ev_settings_timeout) {
+        settings_ack_timeout.clear();
+        if (!e) {
+            create_GOAWAY_frame(ErrorCodes::SETTINGS_TIMEOUT);
+        }
+        return complete_with_goaway(e);
+    }
+
+  private:
+    constexpr cntl_type& cntl() noexcept(true) {
+        return static_cast<cntl_type&>(*this);
+    }
+    void cancel_all() noexcept(true) { cntl()(nullptr); }
+    void terminate_now() noexcept(true) {
+        shutdown_both();
+        io_cntl.send_goaway();
+        __M_strms.clear();
+        cancel_all();
+    }
+    void complete_with_goaway(const std::error_code& e,
+                              ErrorCodes h2_ec = ErrorCodes::NO_ERROR) {
+        if (cntl().tracked_task_empty()) {
+            create_GOAWAY_frame(h2_ec);
+        }
+        cntl().complete(e);
+    }
+
+    bool can_send() noexcept(true) {
+        return io_cntl.want_send() && !pending_frames.empty() &&
+               !io_cntl.is_sending();
     }
 
     void do_send() {
         if (can_send()) {
             io_cntl.set_sending();
+            update_keepalive(std::chrono::seconds(0));
             net::async_write_sequence_exactly(
-                stream().lowest_layer(), std::move(pending_frames),
+                __M_stream.lowest_layer(), std::move(pending_frames),
                 cntl().template next_with_tag<ev_send>());
         }
     }
 
-  protected:
     Stream __M_stream;
-    FixedTimerRef& __M_fixed_timer;
-    std::unique_ptr<Session> __M_session;
+    Connection __M_session;
+    HPackImpl __M_hpack;
+    FixedTimer& __M_tmr;
 
-    void cancel_all() { cntl()(nullptr); }
+    net::cancellation_signal settings_ack_timeout;
+    net::cancellation_signal keepalive_timeout;
 
-    template <typename... Args> constexpr void on(Args&&... args) {
-        if constexpr (std::is_invocable_v<Session, Args&&...>) {
-            session()(std::forward<Args>(args)...);
+    template <typename Rep, typename Period>
+    void update_keepalive(const std::chrono::duration<Rep, Period>& dur) {
+        if (keepalive_timeout) {
+            auto* cntl =
+                net::safe_fixed_timer_controller(__M_tmr, keepalive_timeout);
+            assert(cntl && cntl->valid());
+            if (dur.count() != 0) {
+                std::chrono::time_point<std::chrono::system_clock> desired =
+                    std::chrono::system_clock::now() + dur;
+                if (desired > cntl->time_point()) {
+                    cntl->update(desired);
+                }
+            } else if (cntl->time_point() != net::detail::__zero_time_point) {
+                cntl->update(dur);
+            }
         }
     }
 
-    struct {
-        // whether server want to recv or process next frame
-        constexpr bool want_recv() const noexcept(true) { return v & 1; }
-        // whether server CAN send any frame
-        constexpr bool want_send() const noexcept(true) { return v & 2; }
-        // whether is an outstanding send task
-        constexpr bool is_sending() const noexcept(true) { return v & 4; }
-        // whether there is an outstanding recv task
-        constexpr bool is_recving() const noexcept(true) { return v & 8; }
-
-        // to make server unable to process any frame or send any frame
-        constexpr void shutdown_both() noexcept(true) {
-            shutdown_recv();
-            shutdown_send();
-        }
-        constexpr void shutdown_recv() noexcept(true) { v &= ~1; }
-        constexpr void shutdown_send() noexcept(true) { v &= ~2; }
-
-        constexpr void set_sending() noexcept(true) { v |= 4; }
-        constexpr void unset_sending() noexcept(true) { v &= ~4; }
-
-        constexpr void set_recving() noexcept(true) { v |= 8; }
-        constexpr void unset_recving() noexcept(true) { v &= ~8; }
-
-        constexpr void send_goaway() noexcept(true) { v |= 16; }
-        constexpr bool goaway_sent() noexcept(true) { return v & 16; }
-
-      private:
-        char v = 1 | 2;
-    } io_cntl;
-
-    void do_read() {
-        printf("go to read\n");
-        if (can_read()) {
-            printf("start read\n");
-            io_cntl.set_recving();
-            stream().lowest_layer().async_read_some(
-                net::buffer(__M_inbuf),
-                cntl().template next_with_tag<ev_recv>());
-        }
-    }
-
-    constexpr HPackImpl& hpack() noexcept(true) { return *this; }
-
-    std::vector<unsigned char> __M_inbuf;
-
-    http::h2::frame_type frame_parse;
-    struct {
-        stream_id_type next_header_strm = 0;
-        std::uint8_t padded_length = 0;
-    } data_fsm;
-    enum class StreamStates : int {
-        Open,
-        HalfClosedRemote,
-        HalfClosedLocal,
-    };
+    std::vector<unsigned char> __M_buf;
 
     using payload_rep = http::detail::payload_rep;
     using payload_store = http::detail::payload_store;
     using payload_monostate = http::detail::payload_monostate;
     using payload_variant =
         std::variant<std::tuple<payload_rep, std::vector<net::iovec_buffer>>,
-                     std::vector<unsigned char>, payload_monostate>;
+                     std::vector<unsigned char>, payload_monostate,
+                     std::array<unsigned char, 8>>;
     using pending_frame_type =
         std::tuple<std::array<unsigned char, 9>, payload_variant>;
     template <typename T>
@@ -324,799 +302,22 @@ class h2_impl : HPackImpl {
         return v.emplace_back(std::move(header),
                               payload_variant(std::in_place_index_t<2>{}));
     }
-
-    // new DATA impl
-    struct data_task_t {
-        flags_type flags = 0;
-        std::size_t sz = 0;
-        std::unique_ptr<payload_store> payload;
-        std::vector<net::iovec_buffer> iovec;
-
-        template <typename... Ts>
-        static data_task_t create(flags_type flags, Ts&&... ts) {
-            data_task_t task = {};
-            task.flags = flags;
-
-            std::unique_ptr payload =
-                payload_store::create(std::forward<Ts>(ts)...);
-            task.iovec = http::detail::create_iovec_vector(payload->data);
-            task.sz = std::accumulate(
-                task.iovec.begin(), task.iovec.end(), std::size_t{0},
-                [](std::size_t r, const net::iovec_buffer& a) {
-                    return r + a.size();
-                });
-            task.payload = std::move(payload);
-            return std::move(task);
-        }
-    };
-    // end
-
-    struct h2_stream : session_stream_userdata_type {
-        StreamStates state = StreamStates::Open;
-        int client_window = 65535;
-        int server_window = 65535;
-
-        fields_type fields;
-        std::vector<frame_type> field_blocks;
-
-        std::queue<data_task_t> pending_DATA_tasks;
-
-        template <StreamStates... St>
-        constexpr bool state_any_of() const noexcept(true) {
-            return ((state == St) || ...);
-        }
-        constexpr session_stream_userdata_type& userdata() noexcept(true) {
-            return *this;
-        }
-    };
-    std::map<stream_id_type, h2_stream> __M_strms;
-    std::set<stream_id_type> __M_strms_seek_for_window;
-
-    using strms_iterator = std::map<stream_id_type, h2_stream>::iterator;
-    // bytes client can send
-    int client_conn_window = 65535;
-    // bytes server can send
-    int server_conn_window = 65535;
-    stream_id_type client_largest_id = 0;
-
-    struct {
-        int header_table_size = 4096;
-        // no pp!
-        int enable_push = 1;
-        // useless since chxhttp cannot init stream, for now
-        int max_concurrent_streams = 100;
-        // SENDER's initial window size
-        int initial_window_size = 65535;
-        int max_frame_size = 16384;
-        int max_header_list_size = 8192;
-    } conn_settings;
-    void apply_settings(const views::settings_type::setting_type& setting) {
-        switch (setting.identifier()) {
-        case Settings::SETTINGS_HEADER_TABLE_SIZE: {
-            return hpack().encoder_set_header_table_size(setting.value());
-        }
-        case Settings::SETTINGS_ENABLE_PUSH: {
-            return;
-        }
-        case Settings::SETTINGS_MAX_CONCURRENT_STREAMS: {
-            return;
-        }
-        case Settings::SETTINGS_INITIAL_WINDOW_SIZE: {
-            if (std::uint32_t v = setting.value(); v <= 0x7fffffff) {
-                conn_settings.initial_window_size = v;
-                return;
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FLOW_CONTROL_ERROR));
-            }
-        }
-        case Settings::SETTINGS_MAX_FRAME_SIZE: {
-            if (std::uint32_t v = setting.value();
-                v >= 16384 && v <= 16777215) {
-                conn_settings.max_frame_size = v;
-                return;
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-        }
-        case Settings::SETTINGS_MAX_HEADER_LIST_SIZE: {
-            conn_settings.max_header_list_size = setting.value();
-        }
-        default: {
-            return;
-        }
-        }
+    static auto& __pending_frame_type_emplace_back(
+        std::vector<pending_frame_type>& v,
+        std::array<unsigned char, 9>&& header,
+        std::array<unsigned char, 8>&& ping_payload) {
+        return v.emplace_back(std::move(header),
+                              payload_variant(std::in_place_index_t<3>{},
+                                              std::move(ping_payload)));
     }
-    struct {
-        std::chrono::milliseconds ack_timeout = {};
-    } settings_frame_detail = {};
-    struct {
-        // now chxhttp doesn't have a deadline for PING sent
-        std::set<std::vector<unsigned char>> opaque_data;
-    } ping_frame_detail;
-
-    // net::cancellation_signal watchdog_cncl;
-    std::chrono::milliseconds watchdog_interval =
-        std::chrono::milliseconds(1000);
-    std::chrono::time_point<std::chrono::system_clock>
-        watchdog_settings_ack_deadline = {};
-    void do_watchdog() {
-        assert(watchdog_interval.count() != 0);
-        __M_fixed_timer.async_register(
-            watchdog_interval, cntl().template next_with_tag<ev_watchdog>());
-    }
-
-    constexpr bool
-    client_new_strm_id_must_be_valid(stream_id_type id) noexcept(true) {
-        if (id % 2 == 0) {
-            return false;
-        }
-        if (client_largest_id >= id) {
-            return false;
-        } else {
-            client_largest_id = id;
-            return true;
-        }
-    }
-
-    enum Status { __Start, __FrameHeader } __pstatus = __Start;
-
-    unsigned char frame_header_buf[9] = {};
-    int frame_header_buf_sz = 0;
-    void frame_header_parse() {
-        frame_parse.length = detail::from_network4(frame_header_buf, 3);
-        frame_parse.type = frame_header_buf[3];
-        frame_parse.flags = frame_header_buf[4];
-        frame_parse.stream_id = detail::from_network4(frame_header_buf + 5);
-    }
-
-    void feed2(const unsigned char* ptr, const unsigned char* end) {
-        // std::size_t s = __M_inbuf.size();
-        // const unsigned char *ptr = __M_inbuf.data() + begin, *end = ptr +
-        // s;
-        while (ptr < end && io_cntl.want_recv()) {
-            switch (__pstatus) {
-            case __Start: {
-                if (end - ptr >= 9 - frame_header_buf_sz) {
-                    std::copy_n(ptr, 9 - frame_header_buf_sz,
-                                frame_header_buf + frame_header_buf_sz);
-                    ptr += 9 - frame_header_buf_sz;
-                    frame_header_buf_sz = 0;
-                    frame_header_parse();
-                    __pstatus = __FrameHeader;
-                    // check header...
-                    frame_check_before_payload(frame_parse);
-                    // reserve
-                    if (frame_parse.length != 0) {
-                        if (frame_parse.type != FrameType::DATA) {
-                            frame_parse.payload.reserve(frame_parse.length);
-                        }
-                    } else {
-                        // process frame...
-                        if (frame_parse.type == FrameType::HEADERS ||
-                            frame_parse.type == FrameType::CONTINUATION) {
-                            feed_header(frame_parse, ptr, end);
-                        } else if (frame_parse.type == FrameType::DATA) {
-                            feed_data2(frame_parse, ptr, end);
-                        } else {
-                            process_frame();
-                            frame_parse.clear();
-                            __pstatus = __Start;
-                        }
-                        assert(__pstatus == __Start);
-                    }
-                    break;
-                } else {
-                    frame_header_buf_sz += end - ptr;
-                    std::copy(ptr, end, frame_header_buf + frame_header_buf_sz);
-                    break;
-                }
-            }
-            case __FrameHeader: {
-                if (frame_parse.type == FrameType::DATA) {
-                    feed_data2(frame_parse, ptr, end);
-                } else if (frame_parse.type == FrameType::HEADERS ||
-                           frame_parse.type == FrameType::CONTINUATION) {
-                    feed_header(frame_parse, ptr, end);
-                } else if (end - ptr >=
-                           frame_parse.length - frame_parse.payload_length) {
-                    std::size_t old = frame_parse.payload_length;
-                    frame_parse.payload_length = frame_parse.length;
-                    if (frame_parse.type == FrameType::DATA) {
-                        if (auto ite = __M_strms.find(frame_parse.stream_id);
-                            ite != __M_strms.end()) {
-                            assert(old == frame_parse.payload.size());
-                            frame_parse.payload.resize(frame_parse.length);
-                            std::copy_n(ptr, frame_parse.length - old,
-                                        frame_parse.payload.begin() + old);
-                        }
-                    } else {
-                        assert(old == frame_parse.payload.size());
-                        frame_parse.payload.resize(frame_parse.length);
-                        std::copy_n(ptr, frame_parse.length - old,
-                                    frame_parse.payload.begin() + old);
-                    }
-                    ptr += frame_parse.length - old;
-                    // process frame...
-                    process_frame();
-                    frame_parse.clear();
-                    __pstatus = __Start;
-                    break;
-                } else {
-                    std::size_t old = frame_parse.payload_length;
-                    frame_parse.payload_length += (end - ptr);
-                    if (frame_parse.type == FrameType::DATA) {
-                        if (auto ite = __M_strms.find(frame_parse.stream_id);
-                            ite != __M_strms.end() &&
-                            !session().ignore_DATA_frame(ite->second)) {
-                            assert(old == frame_parse.payload.size());
-                            frame_parse.payload.resize(
-                                frame_parse.payload.size() + (end - ptr));
-                            std::copy(ptr, end,
-                                      frame_parse.payload.begin() + old);
-                        }
-                    } else {
-                        assert(old == frame_parse.payload.size());
-                        frame_parse.payload.resize(frame_parse.payload.size() +
-                                                   (end - ptr));
-                        std::copy(ptr, end, frame_parse.payload.begin() + old);
-                    }
-                    ptr = end;
-                    break;
-                }
-            }
-            }
-        }
-    }
-
-    void feed_data2(frame_type& frame, const unsigned char*& ptr,
-                    const unsigned char* end) {
-        auto ite = __M_strms.find(frame.stream_id);
-        if (ite == __M_strms.end()) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-        }
-        h2_stream& strm = ite->second;
-
-        const unsigned char* begin = ptr;
-        std::size_t avail = std::min(frame.length - frame.payload_length,
-                                     static_cast<length_type>(end - begin));
-
-        if (!(frame.flags & Flags::PADDED)) {
-            // no padded
-            const std::size_t consumed = avail;
-            on(*this, frame.stream_id, strm, data_block{}, ptr, ptr + consumed);
-            ptr += consumed;
-            frame.payload_length += consumed;
-            avail -= consumed;
-
-            if (frame.payload_length == frame.length) {
-                if (frame.flags & Flags::END_STREAM) {
-                    strm.state = StreamStates::HalfClosedRemote;
-                }
-
-                on(*this, frame.stream_id, strm,
-                   views::data_type(std::move(frame)));
-                frame.clear();
-                __pstatus = __Start;
-            }
-        } else {
-            // padded
-            if (frame.payload_length == 0) {
-                data_fsm.padded_length = *(ptr++);
-                ++frame.payload_length;
-                --avail;
-            }
-            if (avail == 0) [[unlikely]] {
-                return;
-            }
-
-            const std::size_t payload_end =
-                frame.length - data_fsm.padded_length;
-            if (frame.payload_length < payload_end) {
-                const std::size_t consumed =
-                    std::min(avail, payload_end - frame.payload_length);
-                on(*this, frame.stream_id, strm, data_block{}, ptr,
-                   ptr + consumed);
-                ptr += consumed;
-                frame.payload_length += consumed;
-                avail -= consumed;
-            }
-            if (avail == 0) [[unlikely]] {
-                return;
-            }
-
-            {
-                const std::size_t consumed = avail;
-                ptr += consumed;
-                frame.payload_length += consumed;
-                avail -= consumed;
-
-                if (frame.payload_length == frame.length) {
-                    if (frame.flags & Flags::END_STREAM) {
-                        strm.state = StreamStates::HalfClosedRemote;
-                    }
-
-                    on(*this, frame.stream_id, strm,
-                       views::data_type(std::move(frame)));
-                    frame.clear();
-                    __pstatus = __Start;
-                }
-            }
-        }
-    }
-
-    void feed_header(frame_type& frame, const unsigned char*& ptr,
-                     const unsigned char* end) {
-        auto ite = __M_strms.find(frame.stream_id);
-        assert(ite != __M_strms.end());
-        h2_stream& strm = ite->second;
-
-        const unsigned char* begin = ptr;
-        std::size_t avail = std::min(frame.length - frame.payload_length,
-                                     static_cast<length_type>(end - begin));
-        if (avail == 0) {
-            return;
-        }
-        if (!(frame.flags & Flags::PADDED)) {
-            // no padded
-            const std::size_t payload_begin =
-                (frame.flags & Flags::PRIORITY) ? 5 : 0;
-
-            // consume priority
-            if (frame.payload_length < payload_begin) {
-                std::size_t consumed =
-                    std::min(avail, payload_begin - frame.payload_length);
-                frame.payload_length += consumed;
-                ptr += consumed;
-                avail -= consumed;
-            }
-            if (avail == 0) [[unlikely]] {
-                return;
-            }
-
-            bool is_end = (frame.payload_length + avail == frame.length &&
-                           frame.flags & Flags::END_HEADERS);
-            hpack().decode_block(ptr, avail, is_end, strm.fields);
-            ptr += avail;
-            frame.payload_length += avail;
-            if (frame.payload_length == frame.length && is_end) {
-                data_fsm.next_header_strm = 0;
-
-                if (frame.flags & Flags::END_STREAM) {
-                    assert(strm.state == StreamStates::Open);
-                    strm.state = StreamStates::HalfClosedRemote;
-                }
-                on(*this, frame.stream_id, strm,
-                   views::headers_type{std::move(frame),
-                                       std::move(strm.fields)});
-                strm.fields.clear();
-                frame.clear();
-                __pstatus = __Start;
-            }
-        } else {
-            // padded
-            if (frame.payload_length == 0) {
-                data_fsm.padded_length = *(ptr++);
-                ++frame.payload_length;
-                --avail;
-            }
-            if (avail == 0) [[unlikely]] {
-                return;
-            }
-
-            const std::size_t payload_begin =
-                (frame.flags & Flags::PRIORITY) ? 6 : 1;
-            const std::size_t payload_end =
-                frame.length - data_fsm.padded_length;
-
-            // consume head
-            if (frame.payload_length < payload_begin) {
-                const std::size_t consumed =
-                    std::min(avail, payload_begin - frame.payload_length);
-                frame.payload_length += consumed;
-                ptr += consumed;
-                avail -= consumed;
-            }
-            if (avail == 0) [[unlikely]] {
-                return;
-            }
-
-            // consume real data
-            if (frame.payload_length < payload_end) {
-                const std::size_t consumed =
-                    std::min(avail, payload_end - frame.payload_length);
-                bool is_end = (frame.payload_length + consumed == payload_end &&
-                               frame.flags & Flags::END_HEADERS);
-                hpack().decode_block(ptr, consumed, is_end, strm.fields);
-                ptr += consumed;
-                frame.payload_length += consumed;
-                avail -= consumed;
-            }
-            if (avail == 0) [[unlikely]] {
-                return;
-            }
-
-            // consume padded
-            {
-                const std::size_t consumed =
-                    std::min(avail, static_cast<std::size_t>(
-                                        frame.length - frame.payload_length));
-                ptr += consumed;
-                frame.payload_length += consumed;
-                avail -= consumed;
-                if (frame.payload_length == frame.length) {
-                    assert(avail == 0);
-                    if (frame.flags & Flags::END_HEADERS) {
-                        data_fsm.next_header_strm = 0;
-
-                        if (frame.flags & Flags::END_STREAM) {
-                            assert(strm.state == StreamStates::Open);
-                            strm.state = StreamStates::HalfClosedRemote;
-                        }
-                        on(*this, frame.stream_id, strm,
-                           views::headers_type{std::move(frame),
-                                               std::move(strm.fields)});
-                        strm.fields.clear();
-                        frame.clear();
-                        __pstatus = __Start;
-                    }
-                }
-            }
-        }
-    }
-
-    void terminate_now(const std::error_code& ec) {
-        terminate_now(static_cast<ErrorCodes>(ec.value()));
-    }
-    void terminate_now(ErrorCodes ec) {
-        // shutdown recv, so that no more frames will be consumed
-        io_cntl.shutdown_recv();
-        create_GOAWAY_frame(ec);
-        do_send();
-    }
-    void terminate_now() {
-        // just terminate right now
-        io_cntl.shutdown_both();
-        cancel_all();
-    }
-
-    void process_frame() {
-        if (!can_read()) [[unlikely]] {
-            return;
-        }
-        if (frame_parse.length != frame_parse.payload.size() ||
-            frame_parse.length != frame_parse.payload_length) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        switch (frame_parse.type) {
-        case FrameType::CONTINUATION: {
-            return process_CONTINUATION();
-        }
-        case FrameType::PRIORITY: {
-            return process_PRIORITY();
-        }
-        case FrameType::RST_STREAM: {
-            return process_RST_STREAM();
-        }
-        case FrameType::SETTINGS: {
-            return process_SETTINGS();
-        }
-        case FrameType::PING: {
-            return process_PING();
-        }
-        case FrameType::GOAWAY: {
-            return process_GOAWAY();
-        }
-        case FrameType::WINDOW_UPDATE: {
-            return process_WINDOW_UPDATE();
-        }
-        default: {
-            return;
-        }
-        }
-    }
-
-    void process_CONTINUATION() {
-        if (headers_frame_header_check(frame_parse) != ErrorCodes::NO_ERROR) {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-        }
-        auto ite = __M_strms.find(frame_parse.stream_id);
-        if (ite == __M_strms.end()) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        h2_stream& strm = ite->second;
-        if (strm.field_blocks.empty()) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        if (frame_parse.flags & Flags::END_HEADERS) {
-            fields_type fields;
-            for (std::size_t i = 0; i < strm.field_blocks.size(); ++i) {
-                auto [pos, len] =
-                    headers_frame_get_payload(strm.field_blocks[i]);
-                hpack().decode_block(strm.field_blocks[i].payload.data() + pos,
-                                     len, false, fields);
-            }
-            auto [pos, len] = headers_frame_get_payload(frame_parse);
-            hpack().decode_block(frame_parse.payload.data() + pos, len, true,
-                                 fields);
-            // on(*this,
-            //    views::headers_type(std::move(frame_parse),
-            //    std::move(fields)));
-        } else {
-            strm.field_blocks.emplace_back(std::move(frame_parse));
-            return;
-        }
-        // lifecycle, but continuation only has END_HEADERS flag
-    }
-    void process_PRIORITY() { return; }
-    void process_RST_STREAM() {
-        if (auto ite = __M_strms.find(frame_parse.stream_id);
-            ite != __M_strms.end()) {
-            // invoke
-            on(*this, ite->first,
-               views::rst_stream_type(std::move(frame_parse)));
-            __M_strms.erase(ite);
-        }
-        return;
-    }
-    void process_SETTINGS() {
-        if (frame_parse.flags & frame_parse.ACK) {
-            if (watchdog_settings_ack_deadline.time_since_epoch().count() !=
-                0) {
-                watchdog_settings_ack_deadline = {};
-                return;
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-        }
-        printf("recv settings\n");
-
-        create_SETTINGS_ACK_frame();
-        // invoke
-        views::settings_type sv(std::move(frame_parse));
-        for (const auto& st : sv) {
-            apply_settings(st);
-        }
-        on(*this, std::move(sv));
-        return;
-    }
-    void process_PING() {
-        // ack
-        create_PING_ACK_frame(std::move(frame_parse.payload));
-        on(*this, views::ping_type(std::move(frame_parse)));
-    }
-    void process_GOAWAY() {
-        /* rfc9113: Once the GOAWAY is sent, the sender will ignore frames
-        sent on streams INITIATED by the RECEIVER if the stream has an
-        identifier higher than the included last stream identifier.
-        ie, client stops sending frames -> shutdown_recv
-        */
-        io_cntl.shutdown_recv();
-        create_GOAWAY_frame(ErrorCodes::NO_ERROR);
-        // invoke
-        on(*this, views::goaway_type(std::move(frame_parse)));
-        return;
-    }
-    void process_WINDOW_UPDATE() {
-        views::window_update_type view(std::move(frame_parse));
-        int inc = view.window_size_increment();
-        if (inc <= 0) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-        }
-        auto safe_inc = [](int old, int inc) -> int {
-            std::int64_t new_val = static_cast<std::int64_t>(old) + inc;
-            if (new_val <= std::numeric_limits<std::int32_t>::max()) {
-                return new_val;
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FLOW_CONTROL_ERROR));
-            }
-        };
-        if (view.stream_id == 0) {
-            server_conn_window = safe_inc(server_conn_window, inc);
-            for (auto ite = __M_strms.begin();
-                 server_conn_window > 0 && ite != __M_strms.end();) {
-                h2_stream& strm = ite->second;
-                auto cur = ite++;
-                if (!strm.pending_DATA_tasks.empty()) {
-                    create_DATA_flush2(cur);
-                }
-            }
-        } else {
-            auto ite = __M_strms.find(view.stream_id);
-            if (ite != __M_strms.end()) {
-                h2_stream& strm = ite->second;
-                strm.server_window = safe_inc(strm.server_window, inc);
-                create_DATA_flush2(ite);
-            }
-        }
-        // invoke
-        on(*this, std::move(view));
-        return;
-    }
-
-    void frame_check_before_payload(const http::h2::frame_type& frame) {
-        if (data_fsm.next_header_strm != 0) [[unlikely]] {
-            if (frame.type != FrameType::CONTINUATION) [[unlikely]] {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-            if (frame.stream_id != data_fsm.next_header_strm) [[unlikely]] {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-        }
-        if (frame.length > conn_settings.max_frame_size) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FRAME_SIZE_ERROR));
-        }
-        /*
-        #1 check previous frame type (END_HEADERS) and check stream state
-        #2 check length of frame, flow-control, and some fixed value
-        */
-        switch (frame.type) {
-        case FrameType::CONTINUATION: {
-            if (data_fsm.next_header_strm != frame.stream_id) [[unlikely]] {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-            if (auto ite = __M_strms.find(frame.stream_id);
-                ite != __M_strms.end()) {
-                h2_stream& strm = ite->second;
-                // check strm state
-                if (strm.state != StreamStates::Open) [[unlikely]] {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-                }
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-        }
-        case FrameType::DATA: {
-            if ((frame.flags & Flags::PADDED) && frame.length < 1)
-                [[unlikely]] {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-            // DATA frames can only be sent when a stream is in the "open"
-            // or "half-closed (remote)" state.
-            if (auto ite = __M_strms.find(frame.stream_id);
-                ite != __M_strms.end()) {
-                h2_stream& strm = ite->second;
-                // check window, and calculate
-                if (frame.length > client_conn_window ||
-                    frame.length > strm.client_window) [[unlikely]] {
-                    __CHXHTTP_H2RT_THROW(
-                        make_ec(ErrorCodes::FLOW_CONTROL_ERROR));
-                } else {
-                    client_conn_window -= frame.length;
-                    strm.client_window -= frame.length;
-                }
-                if (client_conn_window == 0) {
-                    create_WINDOW_UPDATE_frame(0, 65535);
-                }
-                if (strm.client_window == 0) {
-                    create_WINDOW_UPDATE_frame(
-                        frame.stream_id, conn_settings.initial_window_size);
-                }
-                // check strm state
-                if (strm.state == StreamStates::Open) {
-                    return;
-                } else {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-                }
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-        }
-        case FrameType::HEADERS: {
-            if (frame.length < headers_frame_field_block_offset(frame)) {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-            // HEADERS frames can be sent on a stream in the "idle",
-            // "reserved (local)", "open", or "half-closed (remote)" state.
-            if (auto ite = __M_strms.find(frame.stream_id);
-                ite != __M_strms.end()) {
-                // non-idle
-                h2_stream& strm = ite->second;
-                // check strm state
-                if (strm.state != StreamStates::Open) {
-                    return;
-                } else {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-                }
-            } else {
-                // idle
-                h2_stream& strm =
-                    __M_strms.emplace(frame.stream_id, h2_stream{})
-                        .first->second;
-                strm.client_window = conn_settings.initial_window_size;
-                strm.server_window = conn_settings.initial_window_size;
-            }
-        }
-        case FrameType::PRIORITY: {
-            return;
-        }
-        case FrameType::RST_STREAM: {
-            if (frame.stream_id == 0 || frame.stream_id > client_largest_id)
-                [[unlikely]] {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-            if (frame.length != 0x04) [[unlikely]] {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FRAME_SIZE_ERROR));
-            }
-        }
-        case FrameType::SETTINGS: {
-            if (frame.stream_id == 0) {
-                if (frame.flags & Flags::ACK) {
-                    if (frame.length == 0) {
-                        return;
-                    } else {
-                        __CHXHTTP_H2RT_THROW(
-                            make_ec(ErrorCodes::PROTOCOL_ERROR));
-                    }
-                } else {
-                    return;
-                }
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-        }
-        case FrameType::PUSH_PROMISE: {
-            // actually chxhttp should never recv PP
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-        }
-        case FrameType::PING: {
-            if (frame.stream_id == 0) {
-                if (frame.length == 0x08) {
-                    return;
-                } else {
-                    __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FRAME_SIZE_ERROR));
-                }
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-        }
-        case FrameType::GOAWAY: {
-            if (frame.stream_id == 0 && frame.length >= 8) {
-                return;
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-            }
-        }
-        case FrameType::WINDOW_UPDATE: {
-            if (frame.length == 0x04) {
-                if (frame.stream_id == 0) {
-                    return;
-                }
-                if (auto ite = __M_strms.find(frame.stream_id);
-                    ite != __M_strms.end()) {
-                    return;
-                } else {
-                    /**
-                      rfc9113: This means that a receiver could receive a
-                      WINDOW_UPDATE frame on a stream in a "half-closed
-                      (remote)" or "closed" state.
-                     */
-                    if (frame.stream_id <= client_largest_id) {
-                        return;
-                    } else {
-                        __CHXHTTP_H2RT_THROW(
-                            make_ec(ErrorCodes::PROTOCOL_ERROR));
-                    }
-                }
-            } else {
-                __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::FRAME_SIZE_ERROR));
-            }
-        }
-        default: {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
-        }
-        }
-    }
-
     std::vector<pending_frame_type> pending_frames;
     template <typename... Ts>
     constexpr void
     pending_frames_emplace_back(std::array<unsigned char, 9>&& header,
                                 Ts&&... ts) {
-        assert(!io_cntl.goaway_sent());
         __pending_frame_type_emplace_back(pending_frames, std::move(header),
                                           std::forward<Ts>(ts)...);
     }
-
     [[nodiscard]] std::vector<net::iovec_buffer>
     iovec_generator(std::vector<net::iovec_buffer>& iov, std::size_t s,
                     std::size_t* n = nullptr) {
@@ -1145,13 +346,12 @@ class h2_impl : HPackImpl {
         }
         return std::move(_r);
     }
-
     std::array<unsigned char, 9>
-    create_frame_header_helper(FrameType ft, std::size_t len, flags_type flags,
-                               stream_id_type strm_id) noexcept(true) {
+    create_frame_header_helper(FrameType ft, std::size_t len, flags_t flags,
+                               stream_id_t strm_id) noexcept(true) {
         std::array<unsigned char, 9> _r;
         std::uint32_t len_network = htonl(len);
-        ::memcpy(_r.data(), &len_network, 3);
+        ::memcpy(_r.data(), (unsigned char*)&len_network + 1, 3);
 
         _r[3] = static_cast<unsigned char>(ft);
         _r[4] = flags;
@@ -1161,18 +361,1143 @@ class h2_impl : HPackImpl {
         return _r;
     }
 
-    static constexpr flags_type get_flags_from_array(
-        const std::array<unsigned char, 9>& header) noexcept(true) {
-        return header[4];
+    struct {
+        constexpr bool want_recv() const noexcept(true) { return v & 1; }
+        constexpr bool want_send() const noexcept(true) { return v & 2; }
+        constexpr bool is_sending() const noexcept(true) { return v & 4; }
+
+        constexpr void set_sending() noexcept(true) { v |= 4; }
+        constexpr void unset_sending() noexcept(true) { v &= ~4; }
+
+        constexpr void send_goaway() noexcept(true) { v |= 16; }
+        constexpr bool goaway_sent() noexcept(true) { return v & 16; }
+
+        constexpr void shutdown_both() noexcept(true) {
+            shutdown_recv();
+            shutdown_send();
+        }
+        constexpr void shutdown_recv() noexcept(true) { v &= ~1; }
+        constexpr void shutdown_send() noexcept(true) { v &= ~2; }
+
+      private:
+        char v = 1 | 2;
+    } io_cntl;
+
+    void shutdown_recv() noexcept(true) {
+        std::error_code e;
+        __M_stream.shutdown(__M_stream.shutdown_receive, e);
+        keepalive_timeout.emit();
+        io_cntl.shutdown_recv();
     }
-    static constexpr void
-    set_flags_to_array(std::array<unsigned char, 9>& header,
-                       flags_type f) noexcept(true) {
-        header[4] = f;
+    void shutdown_send() noexcept(true) {
+        std::error_code e;
+        __M_stream.shutdown(__M_stream.shutdown_write, e);
+        io_cntl.shutdown_send();
+    }
+    void shutdown_both() noexcept(true) {
+        std::error_code e;
+        __M_stream.shutdown(__M_stream.shutdown_both, e);
+        keepalive_timeout.emit();
+        io_cntl.shutdown_both();
     }
 
+    std::variant<length_parser, type_parser, flags_parser, stream_id_parser,
+                 // data
+                 std::monostate, variable_length_parser, variable_length_parser,
+                 // headers
+                 std::monostate, fixed_length_parser<5>, variable_length_parser,
+                 variable_length_parser,
+                 // priority
+                 fixed_length_parser<5>,
+                 // rst
+                 fixed_length_parser<4>,
+                 // settings
+                 uint16_integer_parser, uint32_integer_parser,
+                 // no pp
+                 // ping
+                 fixed_length_parser<8>,
+                 // goaway
+                 fixed_length_parser<4>, fixed_length_parser<4>,
+                 variable_length_parser,
+                 // window update
+                 uint32_integer_parser,
+                 // continuation
+                 variable_length_parser,
+                 // preface below
+                 fixed_length_parser<24>, length_parser, type_parser,
+                 flags_parser, stream_id_parser>
+        __M_state;
+    std::map<stream_id_t, h2_strm> __M_strms;
+    using h2_strm_iterator = typename std::map<stream_id_t, h2_strm>::iterator;
+
+    enum Settings : std::uint16_t {
+        SETTINGS_HEADER_TABLE_SIZE = 0x01,
+        SETTINGS_ENABLE_PUSH = 0x02,
+        SETTINGS_MAX_CONCURRENT_STREAMS = 0x03,
+        SETTINGS_INITIAL_WINDOW_SIZE = 0x04,
+        SETTINGS_MAX_FRAME_SIZE = 0x05,
+        SETTINGS_MAX_HEADER_LIST_SIZE = 0x06,
+
+        SETTINGS_NO_RFC7540_PRIORITIES = 0x09
+    };
+    struct {
+        int header_table_size = 4096;
+        int enable_push = 1;
+        int max_concurrent_streams = 100;
+        int initial_window_size = 65535;
+        int max_frame_size = 16384;
+        int max_header_list_size = 8192;
+    } conn_settings{};
+    ErrorCodes apply_settings(std::uint16_t key, std::uint32_t val) {
+        switch (key) {
+        case Settings::SETTINGS_HEADER_TABLE_SIZE: {
+            return __M_hpack.encoder_set_header_table_size(val);
+        }
+        case Settings::SETTINGS_ENABLE_PUSH: {
+            return ErrorCodes::NO_ERROR;
+        }
+        case Settings::SETTINGS_MAX_CONCURRENT_STREAMS: {
+            return ErrorCodes::NO_ERROR;
+        }
+        case Settings::SETTINGS_INITIAL_WINDOW_SIZE: {
+            if (std::uint32_t v = val; v <= 0x7fffffff) {
+                conn_settings.initial_window_size = v;
+                return ErrorCodes::NO_ERROR;
+            } else {
+                return ErrorCodes::FLOW_CONTROL_ERROR;
+            }
+        }
+        case Settings::SETTINGS_MAX_FRAME_SIZE: {
+            if (std::uint32_t v = val; v >= 16384 && v <= 16777215) {
+                conn_settings.max_frame_size = v;
+                return ErrorCodes::NO_ERROR;
+            } else {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+        }
+        case Settings::SETTINGS_MAX_HEADER_LIST_SIZE: {
+            conn_settings.max_header_list_size = val;
+            return ErrorCodes::NO_ERROR;
+        }
+        default: {
+            return ErrorCodes::NO_ERROR;
+        }
+        }
+    }
+
+    frame<session_type> current_frame = {};
+    ErrorCodes reset_fsm() {
+        ErrorCodes r = on<ev::frame_complete>(__M_session, *this,
+                                              current_frame.const_self());
+        current_frame = {};
+        __M_state.template emplace<LengthStage>();
+        return r;
+    }
+
+    stream_id_t next_header = 0;
+    stream_id_t client_max_id = 0;
+
+    std::int32_t client_wnd = 65535;
+    std::int32_t server_wnd = 65535;
+
+    ErrorCodes frame_dispatch() {
+        if (current_frame.stream_id &&
+            current_frame.stream_id >
+                std::numeric_limits<std::int32_t>::max()) {
+            return ErrorCodes::PROTOCOL_ERROR;
+        }
+        if (next_header) {
+            if (current_frame.type != CONTINUATION) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            auto ite = __M_strms.find(current_frame.stream_id);
+            if (ite == __M_strms.end()) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+        }
+        switch (current_frame.type) {
+        case DATA: {
+            /*
+            DATA frame requirements:
+            0. state==Open✅
+            1. if PADDED, then length must ge 1.✅
+            2. when PADDED length read, length must ge 1 + PADDED
+            3. length le client wnd and stream client wnd✅
+            */
+            if ((current_frame.flags & Flags::PADDED) &&
+                current_frame.length < 1) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            auto ite = __M_strms.find(current_frame.stream_id);
+            if (ite == __M_strms.end()) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            h2_strm& strm = ite->second;
+            if (strm.state != StreamStates::Open) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (current_frame.length > client_wnd ||
+                current_frame.length > strm.client_wnd) {
+                return ErrorCodes::FLOW_CONTROL_ERROR;
+            }
+            client_wnd -= current_frame.length;
+            strm.client_wnd -= current_frame.length;
+            if (!(current_frame.flags & Flags::PADDED)) {
+                __M_state.template emplace<DataBodyStage>(current_frame.length);
+            } else {
+                __M_state.template emplace<DataPaddingStage>();
+            }
+
+            if (current_frame.flags & Flags::END_STREAM) {
+                strm.state = StreamStates::HalfClosedRemote;
+            }
+            current_frame.strm = strm.weak_from_this();
+            break;
+        }
+        case HEADERS: {
+            /*
+            HEADERS requirements:
+            0. length must ge offset.✅
+            1. state==Open.✅
+            */
+            const std::size_t offset =
+                ((current_frame.flags & Flags::PADDED) ? 1 : 0) +
+                ((current_frame.flags & Flags::PRIORITY) ? 5 : 0);
+            if (current_frame.length < offset) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            auto ite = __M_strms.find(current_frame.stream_id);
+            if (ite == __M_strms.end()) {
+                if (current_frame.stream_id % 2 == 0 ||
+                    (client_max_id &&
+                     current_frame.stream_id <= client_max_id)) {
+                    return ErrorCodes::PROTOCOL_ERROR;
+                }
+                client_max_id = current_frame.stream_id;
+                ite = __M_strms.emplace(current_frame.stream_id, __M_session)
+                          .first;
+                ite->second.self_pos = ite;
+                ite->second.client_wnd = conn_settings.initial_window_size;
+                ite->second.server_wnd = conn_settings.initial_window_size;
+            }
+            h2_strm& strm = ite->second;
+            if (strm.state != StreamStates::Open) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (current_frame.flags & Flags::PADDED) {
+                __M_state.template emplace<HeaderPaddingStage>();
+            } else if (current_frame.flags & Flags::PRIORITY) {
+                __M_state.template emplace<HeaderPriorityStage>();
+            } else {
+                __M_state.template emplace<HeaderBodyStage>(
+                    current_frame.length);
+            }
+            if (!(current_frame.flags & Flags::END_HEADERS)) {
+                next_header = current_frame.stream_id;
+            } else {
+                next_header = 0;
+            }
+
+            if (current_frame.flags & Flags::END_STREAM) {
+                strm.state = StreamStates::HalfClosedRemote;
+            }
+            current_frame.strm = strm.weak_from_this();
+            break;
+        }
+        case PRIORITY: {
+            /*
+            PRIORITY requirements:
+            0. length eq 5
+            */
+            if (current_frame.length != 5) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            __M_state.template emplace<PriorityStage>();
+            break;
+        }
+        case RST_STREAM: {
+            /*
+            RST requirements:
+            0. strm_id eq 0.✅
+            1. strm_id le client_max_id.✅
+            2. length eq 4.✅
+            */
+            if (current_frame.stream_id == 0) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (client_max_id && current_frame.stream_id > client_max_id) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (current_frame.length != 4) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            __M_state.template emplace<RstStage>();
+            break;
+        }
+        case SETTINGS: {
+            /*
+            SETTINGS requirements:
+            0. strm_id eq 0.✅
+            1.0 if ACK, then length eq 0.✅
+            1.1 if not ACK, then length % 6 eq 0.✅
+            */
+            if (current_frame.stream_id != 0) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (current_frame.flags & Flags::ACK) {
+                settings_ack_timeout.emit();
+                if (current_frame.length != 0) {
+                    return ErrorCodes::PROTOCOL_ERROR;
+                }
+                __M_state.template emplace<LengthStage>();
+            } else {
+                if (current_frame.length % 6) {
+                    return ErrorCodes::PROTOCOL_ERROR;
+                }
+                __M_state.template emplace<SettingsKeyStage>();
+            }
+            break;
+        }
+        case PUSH_PROMISE: {
+            /*
+            no PP!
+            */
+            return ErrorCodes::PROTOCOL_ERROR;
+        }
+        case PING: {
+            /*
+            PING requirements:
+            0. length eq 8.✅
+            1. stream_id eq 0.✅
+            2. if ACK, then it must be ACK.
+            */
+            if (current_frame.length != 8) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (current_frame.stream_id != 0) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            __M_state.template emplace<PingStage>();
+            break;
+        }
+        case GOAWAY: {
+            /*
+            GOAWAY requirements:
+            0. length ge 8.✅
+            1. stream_id eq 0.✅
+            */
+            if (current_frame.length < 8) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (current_frame.stream_id != 0) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            __M_state.template emplace<GoAwayStrmIdStage>();
+            break;
+        }
+        case WINDOW_UPDATE: {
+            /*
+            WND_UPD requirements:
+            0. length eq 4.✅
+            1. strm_id exists (not ge client_max_id).✅
+            */
+            if (current_frame.length != 4) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (current_frame.stream_id && client_max_id &&
+                current_frame.stream_id > client_max_id) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (current_frame.stream_id) {
+                if (auto ite = __M_strms.find(current_frame.stream_id);
+                    ite != __M_strms.end()) {
+                    current_frame.strm = ite->second.weak_from_this();
+                }
+            }
+            __M_state.template emplace<WndUpdateStage>();
+            break;
+        }
+        case CONTINUATION: {
+            /*
+            CONTINUATION requirements:
+            0. it must be CONTINUATION :P
+            */
+            if (current_frame.stream_id == 0 ||
+                next_header != current_frame.stream_id) {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            if (auto ite = __M_strms.find(next_header);
+                ite != __M_strms.end()) {
+                current_frame.strm = ite->second.weak_from_this();
+            } else {
+                return ErrorCodes::INTERNAL_ERROR;
+            }
+            if (current_frame.flags & Flags::END_HEADERS) {
+                next_header = 0;
+            }
+            __M_state.template emplace<ContinuationStage>(current_frame.length);
+            break;
+        }
+        default: {
+            return ErrorCodes::PROTOCOL_ERROR;
+        }
+        }
+        return on<ev::frame_start>(__M_session, *this,
+                                   current_frame.const_self());
+    }
+
+    ErrorCodes feed(const unsigned char* begin, const unsigned char* end) {
+        while (begin <= end && io_cntl.want_recv()) {
+            switch (__M_state.index()) {
+            case LengthStage: {
+                length_parser& parser = *std::get_if<LengthStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    current_frame.length = parser.result();
+                    __M_state.template emplace<TypeStage>();
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case TypeStage: {
+                type_parser& parser = *std::get_if<TypeStage>(&__M_state);
+                if (begin == end) {
+                    return ErrorCodes::NO_ERROR;
+                }
+                current_frame.type = *(begin++);
+                __M_state.template emplace<FlagsStage>();
+            }
+            case FlagsStage: {
+                flags_parser& parser = *std::get_if<FlagsStage>(&__M_state);
+                if (begin == end) {
+                    return ErrorCodes::NO_ERROR;
+                }
+                current_frame.flags = *(begin++);
+                __M_state.template emplace<StreamIdStage>();
+            }
+            case StreamIdStage: {
+                stream_id_parser& parser =
+                    *std::get_if<StreamIdStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    current_frame.stream_id = parser.result();
+
+                    // dispatch
+                    if (ErrorCodes r = frame_dispatch();
+                        r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case DataPaddingStage: {
+                if (begin == end) {
+                    return ErrorCodes::NO_ERROR;
+                }
+                current_frame.padding = *(begin++);
+                if (current_frame.length < current_frame.padding + 1) {
+                    return ErrorCodes::PROTOCOL_ERROR;
+                }
+                __M_state.template emplace<DataBodyStage>(
+                    current_frame.length - 1 - current_frame.padding);
+            }
+            case DataBodyStage: {
+                variable_length_parser& parser =
+                    *std::get_if<DataBodyStage>(&__M_state);
+                ParseResult r = parser(begin, end);
+                if (r == ParseSuccess) {
+                    // data
+                    if (ErrorCodes r = on<ev::data_block>(
+                            __M_session, *this, current_frame.const_self(),
+                            parser.begin, parser.end);
+                        r == ErrorCodes::NO_ERROR) {
+                        __M_state.template emplace<DataTail>(
+                            current_frame.padding);
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return on<ev::data_block>(__M_session, *this,
+                                              current_frame.const_self(),
+                                              parser.begin, parser.end);
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case DataTail: {
+                variable_length_parser& parser =
+                    *std::get_if<DataTail>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    // tail, data frame complete
+                    if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case HeaderPaddingStage: {
+                if (begin == end) {
+                    return ErrorCodes::NO_ERROR;
+                }
+                current_frame.padding = *(begin++);
+                if (current_frame.flags & Flags::PRIORITY) {
+                    __M_state.template emplace<HeaderPriorityStage>();
+                } else {
+                    __M_state.template emplace<HeaderBodyStage>(
+                        current_frame.length - current_frame.padding - 1);
+                    break;
+                }
+            }
+            case HeaderPriorityStage: {
+                fixed_length_parser<5>& parser =
+                    *std::get_if<HeaderPriorityStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    const std::size_t offset =
+                        ((current_frame.flags & Flags::PADDED) ? 1 : 0) +
+                        ((current_frame.flags & Flags::PRIORITY) ? 5 : 0);
+                    __M_state.template emplace<HeaderBodyStage>(
+                        current_frame.length - offset - current_frame.padding);
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case HeaderBodyStage: {
+                variable_length_parser& parser =
+                    *std::get_if<HeaderBodyStage>(&__M_state);
+                ParseResult r = parser(begin, end);
+                if (r == ParseSuccess) {
+                    // header
+                    if (ErrorCodes r = __M_hpack.decode(
+                            parser.begin, parser.end,
+                            current_frame.flags & Flags::END_HEADERS);
+                        r == ErrorCodes::NO_ERROR) {
+                        if (ErrorCodes r = on_headers_complete();
+                            r != ErrorCodes::NO_ERROR) {
+                            return r;
+                        }
+                        __M_state.template emplace<HeaderTail>(
+                            current_frame.padding);
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return __M_hpack.decode(parser.begin, parser.end, 0);
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case HeaderTail: {
+                variable_length_parser& parser =
+                    *std::get_if<HeaderTail>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case PriorityStage: {
+                fixed_length_parser<5>& parser =
+                    *std::get_if<PriorityStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case RstStage: {
+                // ok
+                fixed_length_parser<4>& parser =
+                    *std::get_if<RstStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    __M_strms.erase(current_frame.stream_id);
+                    if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case SettingsKeyStage: {
+                // ok
+                if (current_frame.settings_consumed == current_frame.length) {
+                    if (ErrorCodes r = create_SETTINGS_ACK_frame();
+                        r != ErrorCodes::NO_ERROR) {
+                        return r;
+                    }
+                    do_send();
+                    if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                }
+                uint16_integer_parser& parser =
+                    *std::get_if<SettingsKeyStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    current_frame.settings_consumed += 2;
+                    current_frame.settings_key = parser.result();
+                    __M_state.template emplace<SettingsValStage>();
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case SettingsValStage: {
+                // ok
+                uint32_integer_parser& parser =
+                    *std::get_if<SettingsValStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    current_frame.settings_consumed += 4;
+                    if (ErrorCodes r = apply_settings(
+                            current_frame.settings_key, parser.result());
+                        r == ErrorCodes::NO_ERROR) {
+                        __M_state.template emplace<SettingsKeyStage>();
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case PingStage: {
+                // ok
+                fixed_length_parser<8>& parser =
+                    *std::get_if<PingStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    std::array<unsigned char, 8> d;
+                    std::copy_n(parser.result, 8, d.data());
+                    if (ErrorCodes r = create_PING_ACK_frame(std::move(d));
+                        r != ErrorCodes::NO_ERROR) {
+                        return r;
+                    }
+                    do_send();
+                    if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case GoAwayStrmIdStage: {
+                fixed_length_parser<4>& parser =
+                    *std::get_if<GoAwayStrmIdStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    __M_state.template emplace<GoAwayErrorCodeStage>();
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case GoAwayErrorCodeStage: {
+                fixed_length_parser<4>& parser =
+                    *std::get_if<GoAwayErrorCodeStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    __M_state.template emplace<GoAwayDebugStage>(
+                        current_frame.length - 8);
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case GoAwayDebugStage: {
+                variable_length_parser& parser =
+                    *std::get_if<GoAwayDebugStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    client_max_id = -1;
+                    if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case WndUpdateStage: {
+                uint32_integer_parser& parser =
+                    *std::get_if<WndUpdateStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    const std::uint32_t upd = parser.result();
+                    if (upd == 0 ||
+                        upd > std::numeric_limits<std::int32_t>::max()) {
+                        return ErrorCodes::PROTOCOL_ERROR;
+                    }
+                    if (current_frame.stream_id == 0) {
+                        const std::int64_t cur = server_wnd;
+                        if (cur + upd >
+                            std::numeric_limits<std::int32_t>::max()) {
+                            return ErrorCodes::PROTOCOL_ERROR;
+                        }
+                        server_wnd += upd;
+                        for (auto ite = __M_strms.begin();
+                             ite != __M_strms.end() && server_wnd > 0;) {
+                            h2_strm& strm = ite->second;
+                            auto cur = ite++;
+                            if (!strm.pending_DATA_tasks.empty()) {
+                                create_DATA_flush2(cur);
+                            }
+                        }
+                    } else if (current_frame.strm) {
+                        h2_strm& strm = *current_frame.strm;
+                        const std::int64_t cur = strm.server_wnd;
+                        if (cur + upd >
+                            std::numeric_limits<std::int32_t>::max()) {
+                            return ErrorCodes::PROTOCOL_ERROR;
+                        }
+                        strm.server_wnd += upd;
+                        create_DATA_flush2(strm.self_pos);
+                    }
+                    if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case ContinuationStage: {
+                variable_length_parser& parser =
+                    *std::get_if<ContinuationStage>(&__M_state);
+                ParseResult r = parser(begin, end);
+                if (r == ParseSuccess) {
+                    if (ErrorCodes r = __M_hpack.decode(
+                            parser.begin, parser.end,
+                            current_frame.flags & Flags::END_HEADERS);
+                        r == ErrorCodes::NO_ERROR) {
+                        if (ErrorCodes r = on_headers_complete();
+                            r != ErrorCodes::NO_ERROR) {
+                            return r;
+                        }
+                        if (ErrorCodes r = reset_fsm();
+                            r == ErrorCodes::NO_ERROR) {
+                            break;
+                        } else {
+                            return r;
+                        }
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return __M_hpack.decode(parser.begin, parser.end, 0);
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case PrefacePRIStage: {
+                fixed_length_parser<24>& parser =
+                    *std::get_if<PrefacePRIStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    constexpr static char preface[] =
+                        "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+                    if (std::equal(preface, preface + 24, parser.result,
+                                   parser.result + 24)) {
+                        if (ErrorCodes r = create_SETTINGS_frame({});
+                            r == ErrorCodes::NO_ERROR) {
+                            do_send();
+                            __M_state.template emplace<PrefaceLengthStage>();
+                        } else {
+                            return r;
+                        }
+                    } else {
+                        terminate_now();
+                        return ErrorCodes::NOT_H2;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case PrefaceLengthStage: {
+                length_parser& parser =
+                    *std::get_if<PrefaceLengthStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    current_frame.length = parser.result();
+                    __M_state.template emplace<PrefaceTypeStage>();
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            case PrefaceTypeStage: {
+                type_parser& parser =
+                    *std::get_if<PrefaceTypeStage>(&__M_state);
+                if (begin == end) {
+                    return ErrorCodes::NO_ERROR;
+                }
+                current_frame.type = *(begin++);
+                if (current_frame.type == FrameType::SETTINGS) {
+                    __M_state.template emplace<PrefaceFlagsStage>();
+                } else {
+                    return ErrorCodes::PROTOCOL_ERROR;
+                }
+            }
+            case PrefaceFlagsStage: {
+                flags_parser& parser =
+                    *std::get_if<PrefaceFlagsStage>(&__M_state);
+                if (begin == end) {
+                    return ErrorCodes::NO_ERROR;
+                }
+                current_frame.flags = *(begin++);
+                __M_state.template emplace<PrefaceStreamIdStage>();
+            }
+            case PrefaceStreamIdStage: {
+                stream_id_parser& parser =
+                    *std::get_if<PrefaceStreamIdStage>(&__M_state);
+                if (ParseResult r = parser(begin, end); r == ParseSuccess) {
+                    current_frame.stream_id = parser.result();
+
+                    // dispatch
+                    if (ErrorCodes r = frame_dispatch();
+                        r == ErrorCodes::NO_ERROR) {
+                        break;
+                    } else {
+                        return r;
+                    }
+                } else if (r == ParseNeedMore) {
+                    return ErrorCodes::NO_ERROR;
+                } else {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+            }
+            default:
+                assert(false);
+            }
+        }
+        return ErrorCodes::NO_ERROR;
+    }
+
+    ErrorCodes on_headers_complete() {
+        if (current_frame.flags & Flags::END_HEADERS) {
+            fields_type fields;
+            ErrorCodes r = __M_hpack.release(fields);
+            if (r != ErrorCodes::NO_ERROR) {
+                return r;
+            }
+            r = on<ev::header_complete>(__M_session, *this,
+                                        current_frame.const_self(),
+                                        std::move(fields));
+            if (r != ErrorCodes::NO_ERROR) {
+                return r;
+            }
+        }
+        return ErrorCodes::NO_ERROR;
+    }
+
+    template <typename CharT>
+    static CharT* to_network4(std::uint32_t v, CharT* dest,
+                              std::size_t len = 4) {
+        std::uint32_t c = htonl(v);
+        std::memcpy(dest, (std::uint8_t*)&c + 4 - len, len);
+        return dest + len;
+    }
+    template <typename CharT>
+    static CharT* to_network2(std::uint16_t v, CharT* dest,
+                              std::size_t len = 2) {
+        std::uint16_t c = htons(v);
+        std::memcpy(dest, (std::uint8_t*)&c + 2 - len, len);
+        return dest + len;
+    }
+
+    ErrorCodes create_PING_ACK_frame(std::array<unsigned char, 8>&& data) {
+        pending_frames_emplace_back(
+            create_frame_header_helper(FrameType::PING, 8, Flags::ACK, 0),
+            std::move(data));
+        // do_send();
+        return ErrorCodes::NO_ERROR;
+    }
+
+    ErrorCodes create_RST_STREAM_frame(stream_id_t strm_id, ErrorCodes ec) {
+        if (!io_cntl.goaway_sent()) {
+            if (auto ite = __M_strms.find(strm_id); ite != __M_strms.end()) {
+                std::vector<unsigned char> payload(4);
+                to_network4(static_cast<std::uint32_t>(ec), payload.data());
+                pending_frames_emplace_back(
+                    create_frame_header_helper(FrameType::RST_STREAM, 4, 0,
+                                               strm_id),
+                    std::move(payload));
+                __M_strms.erase(ite);
+            }
+        }
+        return ErrorCodes::NO_ERROR;
+    }
+
+    template <typename... Ts>
+    void create_GOAWAY_frame(ErrorCodes e, Ts&&... additional_data) {
+        if (!io_cntl.goaway_sent()) {
+            shutdown_recv();
+            io_cntl.send_goaway();
+            client_max_id = -1;
+            __M_strms.clear();
+            if constexpr (sizeof...(Ts) != 0) {
+                struct goaway_impl {
+                    using value_type = unsigned char;
+                    // last stream id eq 2^31-1: chxhttp won't send any data if
+                    // client is misbehaving.
+                    std::uint32_t stream_id = 0, error_code = 0;
+
+                    const unsigned char* data() const noexcept(true) {
+                        return (const unsigned char*)this;
+                    }
+                    constexpr std::size_t size() const noexcept(true) {
+                        return 8;
+                    }
+                } st;
+                static_assert(sizeof(goaway_impl) == 8);
+                st.stream_id = htonl(largest_strm_id_processed);
+                st.error_code = htonl(e);
+
+                std::size_t frame_length =
+                    8 + (... + net::buffer(additional_data).size());
+                assert(frame_length <= conn_settings.max_frame_size);
+
+                pending_frames_emplace_back(
+                    create_frame_header_helper(FrameType::GOAWAY, frame_length,
+                                               0, 0),
+                    payload_store::create(
+                        st, std::forward<Ts>(additional_data)...));
+            } else {
+                std::array<unsigned char, 8> payload;
+                to_network4(largest_strm_id_processed, payload.data());
+                to_network4(static_cast<std::uint32_t>(e), payload.data() + 4);
+                pending_frames_emplace_back(
+                    create_frame_header_helper(FrameType::GOAWAY, 8, 0, 0),
+                    std::move(payload));
+            }
+            do_send();
+        }
+    }
+
+    ErrorCodes create_SETTINGS_ACK_frame() {
+        if (!io_cntl.goaway_sent()) {
+            pending_frames_emplace_back(create_frame_header_helper(
+                FrameType::SETTINGS, 0, Flags::ACK, 0));
+        }
+        // do_send();
+        return ErrorCodes::NO_ERROR;
+    }
+    ErrorCodes create_SETTINGS_frame(
+        const std::initializer_list<std::pair<std::uint16_t, std::uint32_t>>&
+            list) {
+        if (settings_ack_timeout) {
+            return ErrorCodes::INTERNAL_ERROR;
+        }
+        if (!io_cntl.goaway_sent()) {
+            std::vector<unsigned char> payload(list.size() * 6);
+            unsigned char* ptr = payload.data();
+            for (const auto& [k, v] : list) {
+                if (ErrorCodes r = apply_settings(k, v);
+                    r != ErrorCodes::NO_ERROR) {
+                    return ErrorCodes::INTERNAL_ERROR;
+                }
+                ptr = to_network2(k, ptr);
+                ptr = to_network4(v, ptr);
+            }
+            pending_frames_emplace_back(
+                create_frame_header_helper(FrameType::SETTINGS, payload.size(),
+                                           0, 0),
+                std::move(payload));
+            __M_tmr.async_register(
+                std::chrono::seconds(3),
+                net::bind_cancellation_signal(
+                    settings_ack_timeout,
+                    cntl().template next_with_tag<ev_settings_timeout>()));
+        }
+        return ErrorCodes::NO_ERROR;
+    }
+
+    void create_DATA_flush2(h2_strm_iterator ite) {
+        if (!io_cntl.goaway_sent()) {
+            stream_id_t strm_id = ite->first;
+            h2_strm& strm = ite->second;
+            auto& tasks = strm.pending_DATA_tasks;
+            for (int wnd = std::min(server_wnd, strm.server_wnd);
+                 !tasks.empty() && wnd > 0;) {
+                data_task_t& task = tasks.front();
+                // bytes could be sent of this task
+                std::size_t avail_sz =
+                    std::min(static_cast<std::size_t>(wnd), task.sz);
+                while (avail_sz) {
+                    const std::size_t len = std::min(
+                        avail_sz,
+                        static_cast<std::size_t>(conn_settings.max_frame_size));
+                    std::size_t cur_sz = 0;
+                    std::vector<net::iovec_buffer> iov =
+                        iovec_generator(task.iovec, len, &cur_sz);
+
+                    assert(cur_sz == len);
+                    assert(len <= wnd && len <= task.sz && len <= avail_sz);
+                    server_wnd -= len;
+                    strm.server_wnd -= len;
+                    wnd -= len;
+                    avail_sz -= len;
+                    task.sz -= len;
+
+                    if (task.sz) {
+                        // DATA task not completed
+                        pending_frames_emplace_back(
+                            create_frame_header_helper(FrameType::DATA, len, 0,
+                                                       strm_id),
+                            payload_rep{}, std::move(iov));
+                    } else {
+                        assert(avail_sz == 0);
+                        // DATA task completed
+                        pending_frames_emplace_back(
+                            create_frame_header_helper(
+                                FrameType::DATA, len,
+                                (task.flags & Flags::END_STREAM)
+                                    ? Flags::END_STREAM
+                                    : 0,
+                                strm_id),
+                            payload_rep{std::move(task.payload)},
+                            std::move(iov));
+                    }
+                }
+                if (task.sz == 0) {
+                    if (task.flags & Flags::END_STREAM) {
+                        assert(strm.state == StreamStates::HalfClosedRemote);
+                        __M_strms.erase(ite);
+                        break;
+                    } else {
+                        tasks.pop();
+                    }
+                } else {
+                    assert(wnd == 0);
+                }
+            }
+            do_send();
+        }
+    }
+
+  public:
+    ErrorCodes create_HEADER_frame(flags_t flags, h2_strm& strm,
+                                   status_code code,
+                                   const fields_type& fields) {
+        if (!io_cntl.goaway_sent()) {
+            const stream_id_t strm_id = strm.self_pos->first;
+            std::vector<unsigned char> payload;
+            if (ErrorCodes r = __M_hpack.encode(code, fields, payload);
+                r != ErrorCodes::NO_ERROR) {
+                return r;
+            }
+
+            // send frame
+            if (payload.size() <= conn_settings.max_frame_size) {
+                pending_frames_emplace_back(
+                    create_frame_header_helper(
+                        FrameType::HEADERS, payload.size(),
+                        flags | Flags::END_HEADERS, strm.self_pos->first),
+                    std::move(payload));
+            } else {
+                auto store = payload_store::create(std::move(payload));
+                std::vector<net::iovec_buffer> iovec =
+                    http::detail::create_iovec_vector(store->data);
+                std::vector<net::iovec_buffer> section =
+                    iovec_generator(iovec, conn_settings.max_frame_size);
+                pending_frames_emplace_back(
+                    create_frame_header_helper(
+                        FrameType::HEADERS, conn_settings.max_frame_size,
+                        flags & (~Flags::END_HEADERS) & (~Flags::END_STREAM),
+                        strm_id),
+                    payload_rep{}, std::move(section));
+                assert(!iovec.empty());
+                while (!iovec.empty()) {
+                    std::size_t n = 0;
+                    section = iovec_generator(iovec,
+                                              conn_settings.max_frame_size, &n);
+                    pending_frames_emplace_back(
+                        create_frame_header_helper(FrameType::CONTINUATION, n,
+                                                   flags &
+                                                       (~Flags::END_HEADERS) &
+                                                       (~Flags::END_STREAM),
+                                                   strm_id),
+                        payload_rep{}, std::move(section));
+                }
+                std::get<0>(pending_frames.back())[4] =
+                    flags | Flags::END_HEADERS;
+                std::get<0>(std::get<0>(std::get<1>(pending_frames.back())))
+                    .payload.reset(store.release());
+            }
+            if (flags & Flags::END_STREAM) {
+                send_ES_lifecycle(strm.self_pos);
+            }
+        }
+        return ErrorCodes::NO_ERROR;
+    }
+
+    template <typename... Ts>
+    void create_DATA_frame(flags_t flags, h2_strm& strm, Ts&&... ts) {
+        if (!io_cntl.goaway_sent()) {
+            assert(strm.state == StreamStates::Open ||
+                   strm.state == StreamStates::HalfClosedRemote);
+            std::size_t total_size = 0;
+            if constexpr (sizeof...(Ts)) {
+                total_size = (... + net::buffer(ts).size());
+            }
+
+            if (total_size) {
+                strm.pending_DATA_tasks.push(
+                    data_task_t::create(flags, std::forward<Ts>(ts)...));
+                create_DATA_flush2(strm.self_pos);
+            } else {
+                pending_frames_emplace_back(create_frame_header_helper(
+                    FrameType::DATA, 0, flags, strm.self_pos->first));
+                if (flags & Flags::END_STREAM) {
+                    send_ES_lifecycle(strm.self_pos);
+                }
+            }
+        }
+    }
+
+    stream_id_t largest_strm_id_processed = 0;
+
+  private:
     void send_ES_lifecycle(decltype(__M_strms)::iterator pos) {
-        h2_stream& strm = pos->second;
+        h2_strm& strm = pos->second;
         switch (strm.state) {
         case StreamStates::Open: {
             strm.state = StreamStates::HalfClosedLocal;
@@ -1183,384 +1508,34 @@ class h2_impl : HPackImpl {
             break;
         }
         default: {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::PROTOCOL_ERROR));
+            assert(false);
         }
         }
-    }
-
-  public:
-    constexpr auto& guard() {
-        if (!io_cntl.goaway_sent()) {
-            return *this;
-        } else {
-            throw session_closed();
-        }
-    }
-    constexpr bool get_guard() noexcept(true) { return !io_cntl.goaway_sent(); }
-    constexpr bool
-    h2_stream_ready_for_response(stream_id_type strm_id) noexcept(true) {
-        if (!get_guard()) [[unlikely]] {
-            return false;
-        }
-        if (auto ite = __M_strms.find(strm_id); ite != __M_strms.end()) {
-            h2_stream& strm = ite->second;
-            return strm.template state_any_of<StreamStates::Open,
-                                              StreamStates::HalfClosedRemote>();
-        } else {
-            return false;
-        }
-    }
-
-    template <typename... Ts> void h2_shutdown_recv(ErrorCodes ec, Ts&&... ts) {
-        create_GOAWAY_frame(ec, std::forward<Ts>(ts)...);
-        do_send();
-    }
-
-    void create_HEADER_frame(flags_type flags, stream_id_type strm_id,
-                             const fields_type& fields) {
-        std::vector<unsigned char> payload;
-        hpack().encode(fields, payload);
-
-        // send frame
-        auto ite = __M_strms.find(strm_id);
-        if (ite == __M_strms.end()) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        h2_stream& strm = ite->second;
-        if (!strm.template state_any_of<StreamStates::Open,
-                                        StreamStates::HalfClosedRemote>())
-            [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        if (payload.size() <= conn_settings.max_frame_size) {
-            pending_frames_emplace_back(
-                create_frame_header_helper(FrameType::HEADERS, payload.size(),
-                                           flags | frame_type::END_HEADERS,
-                                           strm_id),
-                std::move(payload));
-        } else {
-            auto store = payload_store::create(std::move(payload));
-            std::vector<net::iovec_buffer> iovec =
-                http::detail::create_iovec_vector(store->data);
-            std::vector<net::iovec_buffer> section =
-                iovec_generator(iovec, conn_settings.max_frame_size);
-            pending_frames_emplace_back(
-                create_frame_header_helper(
-                    FrameType::HEADERS, conn_settings.max_frame_size,
-                    flags & (~frame_type::END_HEADERS), strm_id),
-                payload_rep{}, std::move(section));
-            assert(!iovec.empty());
-            while (!iovec.empty()) {
-                std::size_t n = 0;
-                section =
-                    iovec_generator(iovec, conn_settings.max_frame_size, &n);
-                pending_frames_emplace_back(
-                    create_frame_header_helper(
-                        FrameType::CONTINUATION, n,
-                        flags & (~frame_type::END_HEADERS), strm_id),
-                    payload_rep{}, std::move(section));
-            }
-            set_flags_to_array(std::get<0>(pending_frames.back()),
-                               flags | frame_type::END_HEADERS);
-            std::get<0>(std::get<0>(std::get<1>(pending_frames.back())))
-                .payload.reset(store.release());
-        }
-        if (flags & frame_type::END_STREAM) {
-            send_ES_lifecycle(ite);
-        }
-        // do_send();
-    }
-
-    template <typename... Ts>
-    void create_DATA_frame2(flags_type flags, stream_id_type strm_id,
-                            Ts&&... ts) {
-        auto ite = __M_strms.find(strm_id);
-        if (ite == __M_strms.end()) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        h2_stream& strm = ite->second;
-        if (strm.state != StreamStates::Open &&
-            strm.state != StreamStates::HalfClosedRemote) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        std::size_t total_size = 0;
-        if constexpr (sizeof...(Ts)) {
-            total_size = (... + net::buffer(ts).size());
-        }
-
-        if (total_size) {
-            strm.pending_DATA_tasks.push(
-                data_task_t::create(flags, std::forward<Ts>(ts)...));
-            create_DATA_flush2(ite);
-        } else {
-            pending_frames_emplace_back(
-                create_frame_header_helper(FrameType::DATA, 0, flags, strm_id));
-            if (flags & Flags::END_STREAM) {
-                send_ES_lifecycle(ite);
-            }
-        }
-    }
-
-    void create_RST_STREAM_frame(stream_id_type strm_id, ErrorCodes ec) {
-        if (auto ite = __M_strms.find(strm_id); ite != __M_strms.end()) {
-            std::vector<unsigned char> payload(4);
-            detail::to_network4(static_cast<std::uint32_t>(ec), payload.data());
-            pending_frames_emplace_back(
-                create_frame_header_helper(FrameType::RST_STREAM, 4, 0,
-                                           strm_id),
-                std::move(payload));
-            __M_strms.erase(ite);
-        }
-        // do_send();
-    }
-
-    void create_SETTINGS_frame(
-        const std::vector<views::settings_type::setting_type>& settings) {
-        if (watchdog_settings_ack_deadline.time_since_epoch().count() != 0)
-            [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(INTERNAL_ERROR));
-        }
-        static_assert(sizeof(views::settings_type::setting_type) == 6);
-        std::vector<unsigned char> payload(
-            (const unsigned char*)settings.data(),
-            (const unsigned char*)settings.data() + settings.size() * 6);
-        for (const auto& setting : settings) {
-            apply_settings(setting);
-        }
-        pending_frames_emplace_back(
-            create_frame_header_helper(FrameType::SETTINGS, settings.size() * 6,
-                                       0, 0),
-            std::move(payload));
-        watchdog_settings_ack_deadline = std::chrono::system_clock::now() +
-                                         settings_frame_detail.ack_timeout;
-        // do_send();
-    }
-
-    void create_PING_frame(std::vector<unsigned char> data) {
-        auto [ite, b] = ping_frame_detail.opaque_data.emplace(data);
-        if (!b) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        pending_frames_emplace_back(
-            create_frame_header_helper(FrameType::PING, 8, 0, 0),
-            std::move(data));
-        // do_send();
-    }
-
-  private:
-    void create_SETTINGS_ACK_frame() {
-        pending_frames_emplace_back(create_frame_header_helper(
-            FrameType::SETTINGS, 0, frame_type::ACK, 0));
-        // do_send();
-    }
-
-    void create_PING_ACK_frame(std::vector<unsigned char>&& data) {
-        pending_frames_emplace_back(
-            create_frame_header_helper(FrameType::PING, 8, frame_type::ACK, 0),
-            std::move(data));
-        // do_send();
-    }
-
-    // chxhttp always tries to make sure window size is fixed
-    void create_WINDOW_UPDATE_frame(stream_id_type strm_id, int inc) {
-        if (inc <= 0) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        auto ite = __M_strms.find(strm_id);
-        if (ite == __M_strms.end()) [[unlikely]] {
-            __CHXHTTP_H2RT_THROW(make_ec(ErrorCodes::INTERNAL_ERROR));
-        }
-        h2_stream& strm = ite->second;
-        if (strm.client_window + inc < std::max(strm.client_window, inc) ||
-            client_conn_window + inc < std::max(client_conn_window, inc)) {
-            inc = 0x7fffffff - std::max(client_conn_window, strm.client_window);
-        }
-        std::vector<unsigned char> payload(4);
-        detail::to_network4(inc, payload.data());
-        pending_frames_emplace_back(
-            create_frame_header_helper(FrameType::WINDOW_UPDATE, 4, 0, strm_id),
-            std::move(payload));
-        client_conn_window += inc;
-        strm.client_window += inc;
-        // do_send();
-    }
-
-    // GOAWAY means shutdown_both for chxhttp, and for now
-    template <typename... Ts>
-    void create_GOAWAY_frame(ErrorCodes e,
-                             Ts&&... additional_data) noexcept(true) {
-        io_cntl.shutdown_recv();
-        if constexpr (sizeof...(Ts) != 0) {
-            struct goaway_impl {
-                using value_type = unsigned char;
-                // last stream id eq 0: chxhttp won't send any data if client is
-                // misbehaving.
-                std::uint32_t stream_id = 0, error_code = 0;
-
-                const unsigned char* data() const noexcept(true) {
-                    return (const unsigned char*)this;
-                }
-                constexpr std::size_t size() const noexcept(true) { return 8; }
-            } st;
-            static_assert(sizeof(goaway_impl) == 8);
-            st.error_code = htonl(e);
-
-            std::size_t frame_length =
-                8 + (... + net::buffer(additional_data).size());
-            assert(frame_length <= conn_settings.max_frame_size);
-
-            pending_frames_emplace_back(
-                create_frame_header_helper(FrameType::GOAWAY, frame_length, 0,
-                                           0),
-                payload_store::create(st,
-                                      std::forward<Ts>(additional_data)...));
-        } else {
-            std::vector<unsigned char> payload(8);
-            detail::to_network4(static_cast<std::uint32_t>(e),
-                                payload.data() + 4);
-            pending_frames_emplace_back(
-                create_frame_header_helper(FrameType::GOAWAY, 8, 0, 0),
-                std::move(payload));
-        }
-        io_cntl.send_goaway();
-        do_send();
-    }
-
-    // TODO: make better flow control
-    // 24.08.21 so we need a better DATA impl!
-
-    void create_DATA_flush2(strms_iterator ite) {
-        stream_id_type strm_id = ite->first;
-        h2_stream& strm = ite->second;
-        auto& tasks = strm.pending_DATA_tasks;
-        for (int wnd = std::min(server_conn_window, strm.server_window);
-             !tasks.empty() && wnd > 0;) {
-            data_task_t& task = tasks.front();
-            // bytes could be sent of this task
-            std::size_t avail_sz =
-                std::min(static_cast<std::size_t>(wnd), task.sz);
-            while (avail_sz) {
-                const std::size_t len = std::min(
-                    avail_sz,
-                    static_cast<std::size_t>(conn_settings.max_frame_size));
-                std::size_t cur_sz = 0;
-                std::vector<net::iovec_buffer> iov =
-                    iovec_generator(task.iovec, len, &cur_sz);
-
-                assert(cur_sz == len);
-                assert(len <= wnd && len <= task.sz && len <= avail_sz);
-                server_conn_window -= len;
-                strm.server_window -= len;
-                wnd -= len;
-                avail_sz -= len;
-                task.sz -= len;
-
-                if (task.sz) {
-                    // DATA task not completed
-                    pending_frames_emplace_back(
-                        create_frame_header_helper(FrameType::DATA, len, 0,
-                                                   strm_id),
-                        payload_rep{}, std::move(iov));
-                } else {
-                    assert(avail_sz == 0);
-                    // DATA task completed
-                    pending_frames_emplace_back(
-                        create_frame_header_helper(
-                            FrameType::DATA, len,
-                            (task.flags & Flags::END_STREAM) ? Flags::END_STREAM
-                                                             : 0,
-                            strm_id),
-                        payload_rep{std::move(task.payload)}, std::move(iov));
-                }
-            }
-            if (task.sz == 0) {
-                tasks.pop();
-                if (task.flags & Flags::END_STREAM) {
-                    return send_ES_lifecycle(ite);
-                }
-            } else {
-                assert(wnd == 0);
-            }
-        }
-    }
-
-    constexpr static std::size_t
-    headers_frame_field_block_offset(const frame_type& frame) noexcept(true) {
-        return (frame.flags & frame.PADDED) +
-               ((frame.flags & frame.PRIORITY) ? 5 : 0);
-    }
-    constexpr static ErrorCodes
-    headers_frame_header_check(const frame_type& frame) noexcept(true) {
-        if (frame.flags & frame.PADDED) {
-            const std::size_t padded_length = frame.payload[0];
-            return (frame.length >
-                    ((frame.flags & frame.PRIORITY) ? 6 : 1) + padded_length)
-                       ? ErrorCodes::NO_ERROR
-                       : ErrorCodes::PROTOCOL_ERROR;
-        } else {
-            return (frame.length > ((frame.flags & frame.PRIORITY) ? 5 : 0))
-                       ? ErrorCodes::NO_ERROR
-                       : ErrorCodes::PROTOCOL_ERROR;
-        }
-    }
-    constexpr static std::pair<std::size_t, std::size_t>
-    headers_frame_get_payload(const frame_type& frame) noexcept(true) {
-        if (frame.flags & frame.PADDED) {
-            const std::size_t padded_length = frame.payload[0];
-            return {(frame.flags & frame.PRIORITY) ? 6 : 1,
-                    frame.length - padded_length -
-                        ((frame.flags & frame.PRIORITY) ? 6 : 1)};
-        } else {
-            return {(frame.flags & frame.PRIORITY) ? 5 : 0,
-                    frame.length - ((frame.flags & frame.PRIORITY) ? 5 : 0)};
-        }
-    }
-
-    struct impl_detail {
-        static constexpr char client_connection_preface_cstr[] = {
-            'P', 'R', 'I',  ' ',  '*',  ' ',  'H', 'T', 'T',  'P',  '/',  '2',
-            '.', '0', '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n'};
-    };
-
-    // can server listen and recv right now
-    constexpr bool can_read() noexcept(true) {
-        return io_cntl.want_recv() && !io_cntl.is_recving();
-    }
-    // can server send any frame immediately
-    bool can_send() noexcept(true) {
-        return io_cntl.want_send() && !pending_frames.empty() &&
-               !io_cntl.is_sending();
     }
 };
-template <typename Stream, typename Session, typename H, typename FixedTimerRef>
-h2_impl(Stream&&, std::unique_ptr<Session>, H&&, FixedTimerRef&)
-    -> h2_impl<Stream, Session, std::decay_t<H>, FixedTimerRef>;
-template <typename Stream, typename Session, typename H, typename FixedTimerRef>
-h2_impl(Stream&, std::unique_ptr<Session>, H&&, FixedTimerRef&)
-    -> h2_impl<Stream&, Session, std::decay_t<H>, FixedTimerRef>;
+template <typename Stream, typename Connection, typename HPackImpl,
+          typename FixedTimer>
+operation(Stream&&, Connection&&, HPackImpl&&, FixedTimer&) -> operation<
+    typename net::detail::remove_rvalue_reference<Stream&&>::type,
+    typename net::detail::remove_rvalue_reference<Connection&&>::type,
+    typename net::detail::remove_rvalue_reference<HPackImpl&&>::type,
+    FixedTimer>;
 }  // namespace chx::http::h2::detail
 
 namespace chx::http::h2 {
-template <typename Stream, typename Session, typename HPack,
+template <typename Stream, typename Connection, typename HPack,
           typename FixedTimer, typename CompletionToken>
-decltype(auto) async_http2(Stream&& stream, std::unique_ptr<Session> session,
-                           HPack&& hpack, FixedTimer&& fixed_timer,
+decltype(auto) async_http2(net::io_context& ctx, Stream&& stream,
+                           Connection&& connection, HPack&& hpack,
+                           FixedTimer& timer,
                            CompletionToken&& completion_token) {
-    using operation_type = decltype(detail::h2_impl(
-        std::forward<Stream>(stream), std::move(session),
-        std::forward<HPack>(hpack), std::forward<FixedTimer>(fixed_timer)));
+    using operation_type = decltype(detail::operation(
+        std::forward<Stream>(stream), std::forward<Connection>(connection),
+        std::forward<HPack>(hpack), timer));
     return net::async_combine_reference_count<const std::error_code&>(
-        stream.get_associated_io_context(),
-        std::forward<CompletionToken>(completion_token),
+        ctx, std::forward<CompletionToken>(completion_token),
         net::detail::type_identity<operation_type>{},
-        std::forward<Stream>(stream), std::move(session),
-        std::forward<HPack>(hpack), std::forward<FixedTimer>(fixed_timer));
+        std::forward<Stream>(stream), std::forward<Connection>(connection),
+        std::forward<HPack>(hpack), timer);
 }
 }  // namespace chx::http::h2
-
-/*
-TODO:
-1. remove payload vector of frame later
-1.1 payload isn't necessary for DATA, since chxhttp actually doesn't care about
-what DATA contains.
-*/
