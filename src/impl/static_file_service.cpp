@@ -36,7 +36,7 @@ net::future<> static_file_service(chx::http::request_type request,
     std::string_view request_target = request.request_target;
     struct stat64 st = {};
     if (fstat64(f.native_handler(), &st)) {
-        __CHXNET_THROW_CSTR("fstat64 failed");
+        __CHXNET_THROW_STR("fstat64 failed");
     }
     if (S_ISDIR(st.st_mode)) {
         st = {};
@@ -51,7 +51,7 @@ net::future<> static_file_service(chx::http::request_type request,
         }
         if (!e) {
             if (fstat64(f.native_handler(), &st)) {
-                __CHXNET_THROW_CSTR("fstat64 failed");
+                __CHXNET_THROW_STR("fstat64 failed");
             }
         } else {
             co_return response->end(http::status_code::Forbidden,

@@ -34,7 +34,9 @@ template <typename T> struct visitor;
 
 template <typename Stream, typename Connection, typename HPackImpl,
           typename FixedTimer, typename CntlType = int>
-struct operation {
+struct operation
+    : net::detail::enable_weak_from_this<
+          operation<Stream, Connection, HPackImpl, FixedTimer, CntlType>> {
     template <typename T> friend struct visitor;
     template <typename T> friend struct h2::connection;
 
@@ -199,12 +201,12 @@ struct operation {
     constexpr cntl_type& cntl() noexcept(true) {
         return static_cast<cntl_type&>(*this);
     }
-    void cancel_all() noexcept(true) { cntl()(nullptr); }
-    void terminate_now() noexcept(true) {
-        shutdown_both();
-        io_cntl.send_goaway();
-        __M_strms.clear();
-        cancel_all();
+    void cancel_all() {
+        try {
+            cntl()(nullptr);
+        } catch (const std::exception&) {
+            net::rethrow_with_fatal(std::current_exception());
+        }
     }
     void complete_with_goaway(const std::error_code& e,
                               ErrorCodes h2_ec = ErrorCodes::NO_ERROR) {
@@ -383,22 +385,22 @@ struct operation {
         char v = 1 | 2;
     } io_cntl;
 
-    void shutdown_recv() noexcept(true) {
+    void shutdown_recv() {
         std::error_code e;
         __M_stream.shutdown(__M_stream.shutdown_receive, e);
-        keepalive_timeout.emit();
         io_cntl.shutdown_recv();
+        keepalive_timeout.emit();
     }
-    void shutdown_send() noexcept(true) {
+    void shutdown_send() {
         std::error_code e;
         __M_stream.shutdown(__M_stream.shutdown_write, e);
         io_cntl.shutdown_send();
     }
-    void shutdown_both() noexcept(true) {
+    void shutdown_both() {
         std::error_code e;
         __M_stream.shutdown(__M_stream.shutdown_both, e);
-        keepalive_timeout.emit();
         io_cntl.shutdown_both();
+        keepalive_timeout.emit();
     }
 
     std::variant<length_parser, type_parser, flags_parser, stream_id_parser,
@@ -1491,6 +1493,13 @@ struct operation {
                 }
             }
         }
+    }
+
+    void terminate_now() {
+        shutdown_both();
+        io_cntl.send_goaway();
+        __M_strms.clear();
+        cancel_all();
     }
 
     stream_id_t largest_strm_id_processed = 0;

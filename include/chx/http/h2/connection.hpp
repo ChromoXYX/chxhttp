@@ -156,17 +156,25 @@ template <typename SessionFactory> class connection : private SessionFactory {
         friend connection;
 
         response_impl(Oper* p, const net::detail::weak_ptr<h2_stream>& strm)
-            : oper(p), strm_ptr(strm) {}
+            : oper(p->weak_from_this()), strm_ptr(strm) {}
 
-        Oper* const oper;
+        net::detail::weak_ptr<Oper> oper;
         net::detail::weak_ptr<h2_stream> strm_ptr;
 
       public:
-        virtual std::unique_ptr<response> copy() const override {
+        response_impl(const response_impl&) = default;
+
+        virtual ~response_impl() = default;
+
+        virtual std::unique_ptr<response> make_unique() const override {
             return std::unique_ptr<response_impl>(new response_impl(*this));
         }
+        virtual std::shared_ptr<response> make_shared() const override {
+            return std::make_shared<response_impl>(*this);
+        }
+
         virtual bool get_guard() const noexcept(true) override {
-            return !oper->io_cntl.goaway_sent() && strm_ptr;
+            return oper && !oper->io_cntl.goaway_sent() && strm_ptr;
         }
 
         virtual void end(status_code code, fields_type&& fields) {
@@ -191,21 +199,16 @@ template <typename SessionFactory> class connection : private SessionFactory {
                  net::carrier{std::move(mapped), offset, len});
         }
 
-        const net::ip::tcp::socket& socket() const noexcept(true) override {
-            return oper->__M_stream;
+        virtual net::io_context* get_associated_io_context() const
+            noexcept(true) override {
+            return oper ? &oper->cntl().get_associated_io_context() : nullptr;
         }
-
-        void co_spawn(net::future<>&& future) const {
-            if (get_guard()) {
-                auto& cntl = this->oper->cntl();
-                net::co_spawn(
-                    cntl.get_associated_io_context(),
-                    [](net::future<> f) -> net::task {
-                        co_return co_await f;
-                    }(std::move(future)),
-                    cntl.next_then([oper = oper](const std::error_code& e) {
-                        oper->complete_with_goaway(e);
-                    }));
+        const net::ip::tcp::socket* socket() const noexcept(true) override {
+            return oper ? &oper->__M_stream : nullptr;
+        }
+        virtual void terminate() override {
+            if (oper) {
+                oper->terminate_now();
             }
         }
 

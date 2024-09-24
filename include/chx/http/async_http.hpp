@@ -21,7 +21,7 @@ void on(T&& t, Args&&... args) {
 template <typename Stream, typename Session, typename FixedTimer,
           typename CntlType = int>
 struct operation : CHXNET_NONCOPYABLE,
-                   public net::detail::enable_weak_from_this<
+                   net::detail::enable_weak_from_this<
                        operation<Stream, Session, FixedTimer, CntlType>> {
     using cntl_type = CntlType;
     template <typename T>
@@ -34,8 +34,7 @@ struct operation : CHXNET_NONCOPYABLE,
     template <typename Str, typename Ses, typename Tmr>
     operation(Str&& str, Ses&& ses, Tmr& tmr)
         : __M_nstream(std::forward<Str>(str)),
-          __M_session(std::make_unique<Session>(std::forward<Ses>(ses))),
-          __M_tmr(tmr) {
+          __M_session(std::forward<Ses>(ses)), __M_tmr(tmr) {
         __M_inbuf.resize(4096);
         llhttp_init(&__M_parser, HTTP_REQUEST, &settings.s);
         __M_parser.data = this;
@@ -49,12 +48,18 @@ struct operation : CHXNET_NONCOPYABLE,
     constexpr const CntlType& cntl() const noexcept(true) {
         return static_cast<const CntlType&>(*this);
     }
-    constexpr Session& session() noexcept(true) { return *__M_session; }
+    constexpr Session& session() noexcept(true) { return __M_session; }
     constexpr const Session& session() const noexcept(true) {
-        return *__M_session;
+        return __M_session;
     }
 
-    void cancel_all() { cntl()(nullptr); }
+    void cancel_all() {
+        try {
+            cntl()(nullptr);
+        } catch (const std::exception&) {
+            net::rethrow_with_fatal(std::current_exception());
+        }
+    }
 
     template <typename Cntl> void operator()(Cntl& cntl) {
         on<connection_start>(session(), *this);
@@ -132,7 +137,7 @@ struct operation : CHXNET_NONCOPYABLE,
 
   private:
     Stream __M_nstream;
-    std::unique_ptr<Session> __M_session;
+    Session __M_session;
     FixedTimer& __M_tmr;
     net::cancellation_signal __M_tmr_controller;
 
@@ -350,32 +355,22 @@ struct operation : CHXNET_NONCOPYABLE,
             };
             s.on_headers_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                try {
-                    on<header_complete>(
-                        self->session(),
-                        const_cast<const request_type&>(self->__M_request),
-                        response_impl(self));
-                } catch (const std::exception& ex) {
-                    self->shutdown_recv();
-                    return HPE_PAUSED;
-                }
+                on<header_complete>(
+                    self->session(),
+                    const_cast<const request_type&>(self->__M_request),
+                    response_impl(self));
                 return !self->io_cntl.goaway_sent() ? HPE_OK : HPE_PAUSED;
             };
             s.on_message_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
                 self->__M_parse_state.current_size = 0;
-                try {
-                    if (!llhttp_should_keep_alive(c)) {
-                        self->shutdown_recv();
-                    }
-                    self->update_timeout(std::chrono::seconds(0));
-                    on<message_complete>(self->session(), self->__M_request,
-                                         response_impl(self));
-                    self->__M_request = {};
-                } catch (const std::exception& ex) {
+                if (!llhttp_should_keep_alive(c)) {
                     self->shutdown_recv();
-                    return HPE_PAUSED;
                 }
+                self->update_timeout(std::chrono::seconds(0));
+                on<message_complete>(self->session(), self->__M_request,
+                                     response_impl(self));
+                self->__M_request = {};
                 return !self->io_cntl.goaway_sent() ? HPE_OK : HPE_PAUSED;
             };
         }
@@ -459,29 +454,14 @@ struct operation : CHXNET_NONCOPYABLE,
     // but pending_response is still useful.
     void feed2(const char* ptr, std::size_t len) {
         if (io_cntl.want_recv()) {
-            llhttp_errno r;
-            try {
-                r = llhttp_execute(&__M_parser, ptr, len);
-            } catch (...) {
-                std::rethrow_exception(std::current_exception());
-            }
+            llhttp_errno r = llhttp_execute(&__M_parser, ptr, len);
             switch (r) {
-            case HPE_OK: {
-                // everything was ok
+            case HPE_OK:      // everything was ok
+            case HPE_PAUSED:  // user closed the connection
+            {
                 break;
             }
             case HPE_USER:
-            case HPE_PAUSED: {
-                if (io_cntl.goaway_sent()) {
-                    break;
-                }
-                // header_complete or message_complete throws, should
-                // response with 500 and shutdown
-                fields_type fields;
-                fields.set_field("Server", "chxhttp.h11");
-                response(status_code::Internal_Server_Error, std::move(fields));
-                break;
-            }
                 // something else, and bad request
             default: {
                 fields_type fields;
@@ -507,56 +487,58 @@ struct operation : CHXNET_NONCOPYABLE,
         response_impl(const response_impl&) = default;
         response_impl(response_impl&&) = default;
 
-        std::unique_ptr<response> copy() const override {
-            return std::unique_ptr<response>(new response_impl(__M_p));
+        virtual ~response_impl() = default;
+
+        virtual std::unique_ptr<response> make_unique() const override {
+            return std::unique_ptr<response>(new response_impl(*this));
         }
-        void co_spawn(net::future<>&& future) const {
-            if (get_guard()) {
-                auto& cntl = __M_p.get()->cntl();
-                net::co_spawn(
-                    cntl.get_associated_io_context(),
-                    [](net::future<> f) -> net::task {
-                        co_return co_await f;
-                    }(std::move(future)),
-                    cntl.next_then([&cntl](const std::error_code& e) {
-                        cntl.complete(e);
-                    }));
-            }
+        virtual std::shared_ptr<response> make_shared() const override {
+            return std::make_shared<response_impl>(*this);
         }
 
-        bool get_guard() const noexcept(true) override {
-            return !__M_p.expired() && __M_p->get_guard();
+        virtual bool get_guard() const noexcept(true) override {
+            return __M_p && __M_p->get_guard();
         }
 
-        void end(status_code code, fields_type&& fields) override {
+        virtual void end(status_code code, fields_type&& fields) override {
             __response(code, std::move(fields));
         }
-        void end(status_code code, fields_type&& fields,
-                 std::string_view payload) {
+        virtual void end(status_code code, fields_type&& fields,
+                         std::string_view payload) override {
             __response(code, std::move(fields), std::move(payload));
         }
-        void end(status_code code, fields_type&& fields, std::string payload) {
+        virtual void end(status_code code, fields_type&& fields,
+                         std::string payload) override {
             __response(code, std::move(fields), std::move(payload));
         }
-        void end(status_code code, fields_type&& fields,
-                 std::vector<unsigned char> payload) {
+        virtual void end(status_code code, fields_type&& fields,
+                         std::vector<unsigned char> payload) override {
             __response(code, std::move(fields), std::move(payload));
         }
-        void end(status_code code, fields_type&& fields,
-                 net::mapped_file mapped, std::size_t len, std::size_t offset) {
+        virtual void end(status_code code, fields_type&& fields,
+                         net::mapped_file mapped, std::size_t len,
+                         std::size_t offset) override {
             __response(code, std::move(fields),
                        net::carrier{std::move(mapped), offset, len});
         }
 
-        const net::ip::tcp::socket& socket() const noexcept(true) override {
-            return __M_p->stream();
+        virtual const net::ip::tcp::socket* socket() const
+            noexcept(true) override {
+            return __M_p ? &__M_p->stream() : nullptr;
+        }
+        virtual void terminate() override {
+            if (__M_p) {
+                __M_p->terminate_now();
+            }
+        }
+        virtual net::io_context* get_associated_io_context() const
+            noexcept(true) override {
+            return __M_p ? &__M_p->cntl().get_associated_io_context() : nullptr;
         }
 
       private:
         constexpr response_impl(operation* self) noexcept(true)
             : __M_p(self->weak_from_this()) {}
-        constexpr response_impl(const net::detail::weak_ptr<operation>& p)
-            : __M_p(p) {}
 
         net::detail::weak_ptr<operation> __M_p;
 
@@ -578,19 +560,19 @@ operation(Stream&&, Session&&, FixedTimer&) -> operation<
 }  // namespace chx::http::detail
 
 namespace chx::http {
-template <typename Stream, typename Session, typename FixedTimer,
+template <typename Stream, typename SessionFactory, typename FixedTimer,
           typename CompletionToken>
-decltype(auto) async_http(Stream&& stream, Session&& session,
+decltype(auto) async_http(Stream&& stream, SessionFactory&& session_factory,
                           FixedTimer& fixed_timer,
                           CompletionToken&& completion_token) {
     using operation_type = decltype(detail::operation(
-        std::forward<Stream>(stream), std::forward<Session>(session),
-        fixed_timer));
+        std::forward<Stream>(stream),
+        std::forward<SessionFactory>(session_factory)(), fixed_timer));
     return net::async_combine_reference_count<const std::error_code&>(
         stream.get_associated_io_context(),
         std::forward<CompletionToken>(completion_token),
         net::detail::type_identity<operation_type>{},
-        std::forward<Stream>(stream), std::forward<Session>(session),
-        fixed_timer);
+        std::forward<Stream>(stream),
+        std::forward<SessionFactory>(session_factory)(), fixed_timer);
 }
 }  // namespace chx::http

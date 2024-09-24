@@ -3,9 +3,7 @@
 #include "./status_code.hpp"
 #include "./header.hpp"
 #include "./session_closed.hpp"
-
 #include <chx/net/tcp.hpp>
-#include <chx/net/coroutine2.hpp>
 #include <chx/net/utility.hpp>
 
 namespace chx::http {
@@ -13,7 +11,9 @@ class response {
   public:
     virtual ~response() = default;
 
-    virtual std::unique_ptr<response> copy() const = 0;
+    virtual std::shared_ptr<response> make_shared() const = 0;
+    virtual std::unique_ptr<response> make_unique() const = 0;
+
     virtual bool get_guard() const noexcept(true) = 0;
     virtual void guard() const {
         if (!get_guard()) {
@@ -32,8 +32,9 @@ class response {
                      net::mapped_file mapped, std::size_t len,
                      std::size_t offset = 0) = 0;
 
-    virtual void co_spawn(net::future<>&& future) const = 0;
-
-    virtual const net::ip::tcp::socket& socket() const noexcept(true) = 0;
+    virtual net::io_context* get_associated_io_context() const
+        noexcept(true) = 0;
+    virtual const net::ip::tcp::socket* socket() const noexcept(true) = 0;
+    virtual void terminate() = 0;
 };
 }  // namespace chx::http
