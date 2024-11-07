@@ -67,6 +67,5 @@ AC_PROG_CXX
 AC_CONFIG_FILES([
     Makefile
     include/Makefile
-    src/Makefile
 ])
 AC_OUTPUT
