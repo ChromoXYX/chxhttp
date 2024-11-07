@@ -167,7 +167,7 @@ template <typename SessionFactory> class connection : private SessionFactory {
         virtual ~response_impl() = default;
 
         virtual std::unique_ptr<response> make_unique() const override {
-            return std::unique_ptr<response_impl>(new response_impl(*this));
+            return std::make_unique<response_impl>(*this);
         }
         virtual std::shared_ptr<response> make_shared() const override {
             return std::make_shared<response_impl>(*this);
@@ -177,26 +177,28 @@ template <typename SessionFactory> class connection : private SessionFactory {
             return oper && !oper->io_cntl.goaway_sent() && strm_ptr;
         }
 
-        virtual void end(status_code code, fields_type&& fields) {
+        virtual void do_end(status_code code, fields_type&& fields) override {
             resp(code, std::move(fields));
         }
-        virtual void end(status_code code, fields_type&& fields,
-                         std::string_view payload) {
+        virtual void do_end(status_code code, fields_type&& fields,
+                            std::string_view payload) override {
             resp(code, std::move(fields), std::move(payload));
         }
-        virtual void end(status_code code, fields_type&& fields,
-                         std::string payload) {
+        virtual void do_end(status_code code, fields_type&& fields,
+                            std::string payload) override {
             resp(code, std::move(fields), std::move(payload));
         }
-        virtual void end(status_code code, fields_type&& fields,
-                         std::vector<unsigned char> payload) {
+        virtual void do_end(status_code code, fields_type&& fields,
+                            std::vector<unsigned char> payload) override {
             resp(code, std::move(fields), std::move(payload));
         }
-        virtual void end(status_code code, fields_type&& fields,
-                         net::mapped_file mapped, std::size_t len,
-                         std::size_t offset = 0) {
-            resp(code, std::move(fields),
-                 net::carrier{std::move(mapped), offset, len});
+        virtual void do_end(status_code code, fields_type&& fields,
+                            net::mapped_file mapped) override {
+            resp(code, std::move(fields), std::move(mapped));
+        }
+        virtual void do_end(status_code code, fields_type&& fields,
+                            net::carrier<net::mapped_file> mapped) override {
+            resp(code, std::move(fields), std::move(mapped));
         }
 
         virtual net::io_context* get_associated_io_context() const

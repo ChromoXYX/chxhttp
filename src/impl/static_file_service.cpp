@@ -40,8 +40,7 @@ net::future<> static_file_service(chx::http::request_type request,
     }
     if (S_ISDIR(st.st_mode)) {
         st = {};
-        std::error_code e =
-            net::detail::make_ec(net::errc::no_such_file_or_directory);
+        std::error_code e = net::make_ec(net::errc::no_such_file_or_directory);
         for (const auto& i : info.conf.index_list) {
             f.openat(f, i.c_str(), {.resolve = RESOLVE_IN_ROOT}, e);
             if (!e) {

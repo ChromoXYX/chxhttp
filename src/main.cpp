@@ -2,7 +2,7 @@
 #include <chx/http/h2/async_http2.hpp>
 #include <chx/net.hpp>
 
-#include "./global_ctx.hpp"
+#include "./app/global_ctx.hpp"
 #include "./global_timer.hpp"
 #include "./impl/server.hpp"
 #include "./global_conf.hpp"

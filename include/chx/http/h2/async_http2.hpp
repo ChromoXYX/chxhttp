@@ -33,10 +33,9 @@ namespace chx::http::h2::detail {
 template <typename T> struct visitor;
 
 template <typename Stream, typename Connection, typename HPackImpl,
-          typename FixedTimer, typename CntlType = int>
-struct operation
-    : net::detail::enable_weak_from_this<
-          operation<Stream, Connection, HPackImpl, FixedTimer, CntlType>> {
+          typename CntlType = int>
+struct operation : net::detail::enable_weak_from_this<
+                       operation<Stream, Connection, HPackImpl, CntlType>> {
     template <typename T> friend struct visitor;
     template <typename T> friend struct h2::connection;
 
@@ -94,7 +93,7 @@ struct operation
 
   public:
     template <typename T>
-    using rebind = operation<Stream, Connection, HPackImpl, FixedTimer, T>;
+    using rebind = operation<Stream, Connection, HPackImpl, T>;
 
     template <typename Strm, typename Conn, typename H, typename FixedTmr>
     operation(Strm&& strm, Conn&& conn, H&& h, FixedTmr& tmr)
@@ -103,15 +102,21 @@ struct operation
           __M_tmr(tmr) {}
 
     void operator()(cntl_type& cntl) {
-        __M_buf.resize(4096);
-        __M_state.template emplace<PrefacePRIStage>();
-        __M_stream.lowest_layer().async_read_some(
-            net::buffer(__M_buf), cntl.template next_with_tag<ev_read>());
-        __M_tmr.async_register(
-            std::chrono::seconds(30),
-            net::bind_cancellation_signal(
-                keepalive_timeout,
-                cntl.template next_with_tag<ev_keepalive_timeout>()));
+        try {
+            __M_buf.resize(4096);
+            __M_state.template emplace<PrefacePRIStage>();
+            __M_stream.lowest_layer().async_read_some(
+                net::buffer(__M_buf), cntl.template next_with_tag<ev_read>());
+            __M_tmr.async_register(
+                std::chrono::seconds(30),
+                net::bind_cancellation_signal(
+                    keepalive_timeout,
+                    cntl.template next_with_tag<ev_keepalive_timeout>()));
+        } catch (const std::exception& ex) {
+            terminate_now();
+            cntl.complete(std::error_code{});
+            std::rethrow_exception(std::current_exception());
+        }
     }
 
     void operator()(cntl_type& cntl, const std::error_code& e, std::size_t s,
@@ -181,20 +186,32 @@ struct operation
 
     void operator()(cntl_type& cntl, const std::error_code& e,
                     ev_keepalive_timeout) {
-        keepalive_timeout.clear();
-        if (!e) {
-            shutdown_recv();
+        try {
+            keepalive_timeout.clear();
+            if (!e) {
+                shutdown_recv();
+            }
+            return complete_with_goaway(e);
+        } catch (const std::exception& ex) {
+            terminate_now();
+            cntl.complete(e);
+            std::rethrow_exception(std::current_exception());
         }
-        return complete_with_goaway(e);
     }
 
     void operator()(cntl_type& cntl, const std::error_code& e,
                     ev_settings_timeout) {
-        settings_ack_timeout.clear();
-        if (!e) {
-            create_GOAWAY_frame(ErrorCodes::SETTINGS_TIMEOUT);
+        try {
+            settings_ack_timeout.clear();
+            if (!e) {
+                create_GOAWAY_frame(ErrorCodes::SETTINGS_TIMEOUT);
+            }
+            return complete_with_goaway(e);
+        } catch (const std::exception& ex) {
+            terminate_now();
+            cntl.complete(e);
+            std::rethrow_exception(std::current_exception());
         }
-        return complete_with_goaway(e);
     }
 
   private:
@@ -234,7 +251,7 @@ struct operation
     Stream __M_stream;
     Connection __M_session;
     HPackImpl __M_hpack;
-    FixedTimer& __M_tmr;
+    net::fixed_timer& __M_tmr;
 
     net::cancellation_signal settings_ack_timeout;
     net::cancellation_signal keepalive_timeout;
@@ -242,16 +259,16 @@ struct operation
     template <typename Rep, typename Period>
     void update_keepalive(const std::chrono::duration<Rep, Period>& dur) {
         if (keepalive_timeout) {
-            auto* cntl =
-                net::safe_fixed_timer_controller(__M_tmr, keepalive_timeout);
+            auto* cntl = net::safe_fixed_timer_controller(keepalive_timeout);
             assert(cntl && cntl->valid());
             if (dur.count() != 0) {
-                std::chrono::time_point<std::chrono::system_clock> desired =
-                    std::chrono::system_clock::now() + dur;
+                std::chrono::time_point<std::chrono::steady_clock> desired =
+                    std::chrono::steady_clock::now() + dur;
                 if (desired > cntl->time_point()) {
                     cntl->update(desired);
                 }
-            } else if (cntl->time_point() != net::detail::__zero_time_point) {
+            } else if (cntl->time_point() != net::detail::__zero_time_point<
+                                                 std::chrono::steady_clock>) {
                 cntl->update(dur);
             }
         }
@@ -390,6 +407,7 @@ struct operation
         __M_stream.shutdown(__M_stream.shutdown_receive, e);
         io_cntl.shutdown_recv();
         keepalive_timeout.emit();
+        keepalive_timeout.clear();
     }
     void shutdown_send() {
         std::error_code e;
@@ -401,6 +419,7 @@ struct operation
         __M_stream.shutdown(__M_stream.shutdown_both, e);
         io_cntl.shutdown_both();
         keepalive_timeout.emit();
+        keepalive_timeout.clear();
     }
 
     std::variant<length_parser, type_parser, flags_parser, stream_id_parser,
@@ -1533,10 +1552,10 @@ operation(Stream&&, Connection&&, HPackImpl&&, FixedTimer&) -> operation<
 
 namespace chx::http::h2 {
 template <typename Stream, typename Connection, typename HPack,
-          typename FixedTimer, typename CompletionToken>
+          typename CompletionToken>
 decltype(auto) async_http2(net::io_context& ctx, Stream&& stream,
                            Connection&& connection, HPack&& hpack,
-                           FixedTimer& timer,
+                           net::fixed_timer& timer,
                            CompletionToken&& completion_token) {
     using operation_type = decltype(detail::operation(
         std::forward<Stream>(stream), std::forward<Connection>(connection),
