@@ -21,8 +21,9 @@ void on(T&& t, Args&&... args) {
 
 template <typename Stream, typename Session, typename CntlType = int>
 struct operation
-    : CHXNET_NONCOPYABLE,
-      net::detail::enable_weak_from_this<operation<Stream, Session, CntlType>> {
+    : net::detail::enable_weak_from_this<operation<Stream, Session, CntlType>> {
+    CHXNET_NONCOPYABLE
+
     using cntl_type = CntlType;
     template <typename T> using rebind = operation<Stream, Session, T>;
     struct internal_read {};
