@@ -1,52 +1,10 @@
 #pragma once
 
-#include <cstdint>
-#include <algorithm>
-#include <cstring>
-#include <netinet/in.h>
-#include <limits>
+#include "../../../detail/parser.hpp"
 #include "./types.hpp"
 
 namespace chx::http::h2::detail {
-enum [[nodiscard]] ParseResult {
-    ParseSuccess,
-    ParseNeedMore,
-    ParseMalformed,
-    ParseInternalError
-};
-
-template <std::size_t N> struct fixed_length_parser {
-    static_assert(N <= std::numeric_limits<std::uint8_t>::max());
-    constexpr ParseResult operator()(const unsigned char*& begin,
-                                     const unsigned char* end) noexcept(true) {
-        const std::size_t n =
-            std::min(static_cast<std::size_t>(N - consumed),
-                     static_cast<std::size_t>(std::distance(begin, end)));
-        for (std::size_t i = 0; i < n; ++i) {
-            result[consumed++] = *(begin++);
-        }
-        return consumed == N ? ParseSuccess : ParseNeedMore;
-    }
-
-    std::uint8_t consumed = 0;
-    unsigned char result[N] = {};
-};
-
-struct uint16_integer_parser : fixed_length_parser<2> {
-    std::uint16_t result() noexcept(true) {
-        std::uint16_t r = 0;
-        ::memcpy((unsigned char*)&r, fixed_length_parser<2>::result, 2);
-        return ntohs(r);
-    }
-};
-
-struct uint32_integer_parser : fixed_length_parser<4> {
-    std::uint32_t result() noexcept(true) {
-        std::uint32_t r = 0;
-        ::memcpy((unsigned char*)&r, fixed_length_parser<4>::result, 4);
-        return ntohl(r);
-    }
-};
+using namespace chx::detail::parser;
 
 struct length_parser : fixed_length_parser<3> {
     length_t result() noexcept(true) {

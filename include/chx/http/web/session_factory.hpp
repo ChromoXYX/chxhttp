@@ -11,15 +11,14 @@ template <typename Dispatcher> struct dispatcher_session {
     constexpr dispatcher_session(dispatcher_session&& other) noexcept(true) =
         default;
 
-    void operator()(header_complete, const request_type& request,
-                    response&& resp) {
+    void operator()(header_complete, request_type& request, response&& resp) {
         assert(uv.index() == 0);
-        auto [preferred_, controller_] = self->get(request);
-        if (controller_) {
-            auto& [controller, session_data] = uv.template emplace<1>(
-                controller_, controller_->create_session());
+        auto [preferred_, controller] = self->get(request);
+        if (controller) {
             try {
-                controller->on_header_complete(session_data.get(), request);
+                std::shared_ptr session_storage =
+                    controller->on_header_complete(request);
+                uv.template emplace<1>(controller, session_storage);
             } catch (const std::exception&) {
                 uv.template emplace<3>(std::current_exception());
             }
@@ -29,11 +28,11 @@ template <typename Dispatcher> struct dispatcher_session {
         }
     }
 
-    void operator()(data_block, const request_type& request, response&& resp,
+    void operator()(data_block, request_type& request, response&& resp,
                     const unsigned char* begin, const unsigned char* end) {
         if (auto* p = std::get_if<1>(&uv); p) {
             try {
-                p->first->on_data_block(p->second.get(), request, begin, end);
+                p->first->on_data_block(p->second, request, begin, end);
             } catch (const std::exception&) {
                 uv.template emplace<3>(std::current_exception());
             }
@@ -45,7 +44,7 @@ template <typename Dispatcher> struct dispatcher_session {
         case 1: {
             auto& p = *std::get_if<1>(&uv);
             try {
-                p.first->on_message_complete(p.second.get(), request,
+                p.first->on_message_complete(p.second, request,
                                              std::move(resp));
             } catch (const std::exception&) {
                 safe_invoke(self->get_uncaught_exception_handler(),
@@ -70,9 +69,14 @@ template <typename Dispatcher> struct dispatcher_session {
         uv.template emplace<0>();
     }
 
-    void operator()(backend_timeout, const request_type& req, response&& resp) {
+    void operator()(backend_timeout, request_type& req, response&& resp) {
         safe_invoke(self->get_error_handler(),
                     http::status_code::Gateway_Timeout, req, resp);
+    }
+
+    void operator()(ev::request_4xx, status_code code, request_type& req,
+                    response&& resp) {
+        safe_invoke(self->get_error_handler(), code, req, resp);
     }
 
   protected:
@@ -80,7 +84,7 @@ template <typename Dispatcher> struct dispatcher_session {
 
     std::variant<
         std::monostate,
-        std::pair<controller_base*, std::unique_ptr<controller_context_base>>,
+        std::pair<controller_base*, std::shared_ptr<controller_context_base>>,
         status_code, std::exception_ptr>
         uv;
 

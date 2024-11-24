@@ -27,13 +27,7 @@ class response {
     virtual void terminate() = 0;
 
     template <typename... Ts>
-    void end(status_code code, fields_type&& fields, Ts&&... ts) {
-        try {
-            do_end(code, std::move(fields), std::forward<Ts>(ts)...);
-        } catch (const std::exception&) {
-            net::rethrow_with_fatal(std::current_exception());
-        }
-    }
+    void end(status_code code, fields_type&& fields, Ts&&... ts);
 
   private:
     virtual void do_end(status_code code, fields_type&& fields) = 0;
@@ -47,5 +41,31 @@ class response {
                         net::mapped_file mapped) = 0;
     virtual void do_end(status_code code, fields_type&& fields,
                         net::carrier<net::mapped_file> mapped) = 0;
+    virtual void do_end(status_code code, fields_type&& fields,
+                        net::vcarrier&& vc) = 0;
+
+    struct can_do_end_directly;
 };
+
+struct response::can_do_end_directly {
+    template <typename... Ts,
+              typename = decltype(std::declval<response>().do_end(
+                  std::declval<status_code>(), std::declval<fields_type>(),
+                  std::declval<Ts&&>()...))>
+    can_do_end_directly(Ts&&...);
+};
+
+template <typename... Ts>
+void response::end(status_code code, fields_type&& fields, Ts&&... ts) {
+    try {
+        if constexpr (std::is_constructible_v<can_do_end_directly, Ts&&...>) {
+            do_end(code, std::move(fields), std::forward<Ts>(ts)...);
+        } else {
+            do_end(code, std::move(fields),
+                   net::vcarrier::create(std::forward<Ts>(ts)...));
+        }
+    } catch (const std::exception&) {
+        net::rethrow_with_fatal(std::current_exception());
+    }
+}
 }  // namespace chx::http

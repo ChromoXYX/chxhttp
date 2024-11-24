@@ -177,6 +177,20 @@ template <typename SessionFactory> class connection : private SessionFactory {
             return oper && !oper->io_cntl.goaway_sent() && strm_ptr;
         }
 
+        virtual net::io_context* get_associated_io_context() const
+            noexcept(true) override {
+            return oper ? &oper->cntl().get_associated_io_context() : nullptr;
+        }
+        const net::ip::tcp::socket* socket() const noexcept(true) override {
+            return oper ? &oper->__M_stream : nullptr;
+        }
+        virtual void terminate() override {
+            if (oper) {
+                oper->terminate_now();
+            }
+        }
+
+      private:
         virtual void do_end(status_code code, fields_type&& fields) override {
             resp(code, std::move(fields));
         }
@@ -200,21 +214,11 @@ template <typename SessionFactory> class connection : private SessionFactory {
                             net::carrier<net::mapped_file> mapped) override {
             resp(code, std::move(fields), std::move(mapped));
         }
-
-        virtual net::io_context* get_associated_io_context() const
-            noexcept(true) override {
-            return oper ? &oper->cntl().get_associated_io_context() : nullptr;
-        }
-        const net::ip::tcp::socket* socket() const noexcept(true) override {
-            return oper ? &oper->__M_stream : nullptr;
-        }
-        virtual void terminate() override {
-            if (oper) {
-                oper->terminate_now();
-            }
+        virtual void do_end(status_code code, fields_type&& fields,
+                            net::vcarrier&& vcarrier) override {
+            resp(code, std::move(fields), std::move(vcarrier));
         }
 
-      private:
         template <typename... Payloads>
         void resp(status_code code, fields_type&& fields,
                   Payloads&&... payloads) {

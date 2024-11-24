@@ -6,6 +6,7 @@
 #include "./detail/payload.hpp"
 #include "./session_closed.hpp"
 #include "./response.hpp"
+#include "./options.hpp"
 
 #include <chx/log.hpp>
 #include <chx/net.hpp>
@@ -19,6 +20,14 @@ void on(T&& t, Args&&... args) {
     }
 }
 
+/*
+About timeout:
+now there are only 2 timeouts: read_timeout and write_timeout.
+for read_timeout: updates timer after every read operation completes, pauses
+when message_complete (wait for backend), and gets resumed after every pending
+data sent.
+*/
+
 template <typename Stream, typename Session, typename CntlType = int>
 struct operation
     : net::detail::enable_weak_from_this<operation<Stream, Session, CntlType>> {
@@ -28,21 +37,21 @@ struct operation
     template <typename T> using rebind = operation<Stream, Session, T>;
     struct internal_read {};
     struct internal_write {};
-    struct internal_write_final {};
     struct internal_timeout {};
     struct internal_backend_timeout {};
 
     template <typename Str, typename Ses, typename Tmr>
-    operation(Str&& str, Ses&& ses, Tmr& tmr)
-        : __M_nstream(std::forward<Str>(str)),
-          __M_session(std::forward<Ses>(ses)), __M_tmr(tmr) {
+    operation(Str&& str, Ses&& ses, Tmr& tmr, const options_t* options)
+        : __M_stream(std::forward<Str>(str)),
+          __M_session(std::forward<Ses>(ses)), __M_tmr(tmr),
+          __M_options(options) {
         __M_inbuf.resize(4096);
         llhttp_init(&__M_parser, HTTP_REQUEST, &settings.s);
         __M_parser.data = this;
     }
 
-    auto& stream() { return __M_nstream; }
-    const auto& stream() const { return __M_nstream; }
+    auto& stream() { return __M_stream; }
+    const auto& stream() const { return __M_stream; }
     constexpr CntlType& cntl() noexcept(true) {
         return static_cast<CntlType&>(*this);
     }
@@ -68,9 +77,9 @@ struct operation
             do_read();
 
             __M_tmr.async_register(
-                std::chrono::seconds(3),
+                __M_options->keepalive_timeout,
                 net::bind_cancellation_signal(
-                    __M_tmr_controller,
+                    __M_keepalive_controller,
                     cntl.template next_with_tag<internal_timeout>()));
         } catch (const std::exception&) {
             terminate_now();
@@ -85,13 +94,14 @@ struct operation
         try {
             io_cntl.unset_recving();
             if (!e) {
+                update_keepalive_timeout(__M_options->keepalive_timeout);
                 __M_inbuf_begin = __M_inbuf.data();
                 __M_inbuf_sz = s;
                 feed2(__M_inbuf_begin, __M_inbuf_sz);
             } else if (e == net::errc::eof || e == net::errc::io_error) {
                 shutdown_recv();
             } else {
-                // network failure, mostly eof
+                // network failure
                 terminate_now();
             }
             cntl.complete(e);
@@ -110,39 +120,12 @@ struct operation
             // internal_write would never get cancelled, except for
             // terminate_now()
             if (!e) {
-                if (__M_strms.empty()) {
-                    update_timeout(std::chrono::seconds(3));
+                if (__M_strms.empty() && io_cntl.want_recv()) {
+                    // no pending response, and can still read
+                    update_keepalive_timeout(__M_options->keepalive_timeout);
                 }
-                if (!io_cntl.goaway_sent()) {
-                    do_send();
-                } else {
-                    cancel_all();
-                    if (can_send()) {
-                        io_cntl.set_sending();
-                        net::async_write_sequence_exactly(
-                            stream().lowest_layer(),
-                            std::move(__M_pending_response),
-                            cntl.template next_with_tag<
-                                internal_write_final>());
-                    }
-                }
+                do_send();
             } else {
-                terminate_now();
-            }
-            cntl.complete(e);
-        } catch (const std::exception&) {
-            terminate_now();
-            cntl.complete(std::error_code{});
-            std::rethrow_exception(std::current_exception());
-        }
-    }
-
-    template <typename Cntl>
-    void operator()(Cntl& cntl, const std::error_code& e, std::size_t s,
-                    internal_write_final) {
-        try {
-            io_cntl.unset_sending();
-            if (e) {
                 terminate_now();
             }
             cntl.complete(e);
@@ -156,6 +139,7 @@ struct operation
     template <typename Cntl>
     void operator()(Cntl& cntl, const std::error_code& e, internal_timeout) {
         try {
+            __M_keepalive_controller.clear();
             if (!e) {
                 shutdown_recv();
             }
@@ -171,7 +155,7 @@ struct operation
     void operator()(Cntl& cntl, const std::error_code& e,
                     internal_backend_timeout) {
         try {
-            __M_backend_tmr_controller.clear();
+            __M_backend_controller.clear();
             if (!e) {
                 while (!__M_strms.empty() &&
                        __M_strms.begin()->second.ddl <
@@ -189,10 +173,10 @@ struct operation
                     __M_tmr.async_register(
                         __M_strms.begin()->second.ddl,
                         bind_cancellation_signal(
-                            __M_backend_tmr_controller,
+                            __M_backend_controller,
                             cntl.template next_with_tag<
                                 internal_backend_timeout>()));
-                    assert(__M_backend_tmr_controller);
+                    assert(__M_backend_controller);
                 }
             }
             cntl.complete(e);
@@ -204,16 +188,21 @@ struct operation
     }
 
   private:
-    Stream __M_nstream;
+    Stream __M_stream;
     Session __M_session;
     net::fixed_timer& __M_tmr;
-    net::cancellation_signal __M_tmr_controller;
-    net::cancellation_signal __M_backend_tmr_controller;
+    net::cancellation_signal
+        __M_keepalive_controller;  // keepalive_timeout equals to
+                                   // lingering_timeout
+    net::cancellation_signal __M_backend_controller;
+
+    const options_t* const __M_options;
 
     template <typename Rep, typename Period>
-    void update_timeout(const std::chrono::duration<Rep, Period>& dur) {
-        if (__M_tmr_controller.valid()) {
-            auto* cntl = net::fixed_timer_controller(__M_tmr_controller);
+    void
+    update_keepalive_timeout(const std::chrono::duration<Rep, Period>& dur) {
+        if (__M_keepalive_controller.valid()) {
+            auto* cntl = net::fixed_timer_controller(__M_keepalive_controller);
             assert(cntl && cntl->valid());
 
             if (dur.count() != 0) {
@@ -241,7 +230,18 @@ struct operation
                    std::vector<net::iovec_buffer>>,
         std::tuple<std::string_view, std::string, std::string, std::string_view,
                    std::string_view>,
-        std::string_view>;
+        std::string_view,
+        std::tuple<std::string_view, std::string, std::string, std::string_view,
+                   net::vcarrier>>;
+    enum __Resp_Var : std::size_t {
+        __Resp_HeaderOnly = 0,
+        __Resp_Norm = 1,
+        __Resp_Vector = 2,
+        __Resp_IovecVector = 3,
+        __Resp_StringView = 4,
+        __Resp_RawStringView = 5,
+        __Resp_VCarrier = 6
+    };
     std::vector<response_variant_t> __M_pending_response;
     std::queue<std::pair<std::size_t, response_variant_t>> __M_strms_queue;
     std::size_t __M_next_in_stream_id = 0;
@@ -268,13 +268,13 @@ struct operation
     void set_stream_backend_ddl(const net::detail::weak_ptr<h11_stream>& ptr) {
         h11_stream& strm = *ptr;
         strm.ddl = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        if (!__M_backend_tmr_controller) {
+        if (!__M_backend_controller) {
             __M_tmr.async_register(
                 strm.ddl,
                 bind_cancellation_signal(
-                    __M_backend_tmr_controller,
+                    __M_backend_controller,
                     cntl().template next_with_tag<internal_backend_timeout>()));
-            assert(__M_backend_tmr_controller);
+            assert(__M_backend_controller);
         }
     }
 
@@ -285,7 +285,7 @@ struct operation
                "stream id of response must >= __M_next_stream_id");
         assert(__M_strms.erase(strm_id) == 1);
         if (__M_strms.empty()) {
-            __M_backend_tmr_controller.emit();
+            __M_backend_controller.emit();
         }
         if (strm_id == __M_next_out_stream_id) {
             __M_pending_response.emplace_back(
@@ -355,40 +355,39 @@ struct operation
         } else {
             using __dct = std::decay_t<T>;
             if constexpr (std::is_same_v<__dct, std::vector<unsigned char>>) {
-                __response_emplace<2>(strm_id, code, fields, std::move(t));
+                __response_emplace<__Resp_Vector>(strm_id, code, fields,
+                                                  std::move(t));
             } else if constexpr (std::is_same_v<__dct, std::string_view>) {
-                __response_emplace<4>(strm_id, code, fields, t);
+                __response_emplace<__Resp_StringView>(strm_id, code, fields, t);
             } else if constexpr (std::is_same_v<
                                      __dct, std::vector<net::iovec_buffer>>) {
-                __response_emplace<3>(strm_id, code, fields, std::move(t));
+                __response_emplace<__Resp_IovecVector>(strm_id, code, fields,
+                                                       std::move(t));
+            } else if constexpr (std::is_same_v<__dct, net::vcarrier>) {
+                __response_emplace<__Resp_VCarrier>(strm_id, code, fields,
+                                                    std::move(t));
             } else {
-                return __response_multi(strm_id, code, fields,
-                                        std::forward<T>(t));
+                return __response_single(
+                    strm_id, code, fields,
+                    net::vcarrier::create(std::forward<T>(t)));
             }
         }
     }
 
   public:
     constexpr auto& guard() {
-        if (!io_cntl.goaway_sent()) {
+        if (get_guard()) {
             return *this;
         } else {
             throw session_closed();
         }
     }
-    constexpr bool get_guard() noexcept(true) {
-        return !io_cntl.goaway_sent() && io_cntl.want_send();
-    }
+    constexpr bool get_guard() noexcept(true) { return io_cntl.want_send(); }
 
     template <typename... Ts>
     void response(std::size_t strm_id, status_code code, fields_type fields,
                   Ts&&... ts) {
         if (get_guard()) {
-            if (code == status_code::Bad_Request) {
-                io_cntl.send_goaway();
-                shutdown_recv();
-            }
-
             // content length
             std::size_t content_length = 0;
             if constexpr (sizeof...(Ts)) {
@@ -415,7 +414,7 @@ struct operation
 
     void terminate_now() {
         shutdown_both();
-        io_cntl.send_goaway();
+        // io_cntl.send_goaway();
         cancel_all();
     }
 
@@ -426,11 +425,13 @@ struct operation
         static int consume(llhttp_t* c, const char* p, std::size_t s) {
             operation* self = static_cast<operation*>(c->data);
             if (self->__M_parse_state.current_size + s <=
-                self->__M_parse_state.current_max) {
+                self->__M_options->max_header_size) {
                 self->__M_parse_state.current_size += s;
                 self->__M_pbuf.append(p, s);
                 return HPE_OK;
             } else {
+                self->__M_parse_state.suggested_status_code =
+                    http::status_code::URI_Too_Long;
                 return -1;
             }
         }
@@ -439,17 +440,18 @@ struct operation
             s.on_body = [](llhttp_t* c, const char* p, std::size_t s) -> int {
                 operation* self = static_cast<operation*>(c->data);
                 if (self->__M_parse_state.current_size + s <=
-                    self->__M_parse_state.current_max) {
+                    self->__M_options->max_payload_size) {
                     self->__M_parse_state.current_size += s;
                     if (self->__M_curr_strm) {
                         on<data_block>(self->session(),
-                                       const_cast<const request_type&>(
-                                           self->__M_curr_strm->request),
+                                       self->__M_curr_strm->request,
                                        response_impl(self, self->__M_curr_strm),
                                        (const unsigned char*)p,
                                        (const unsigned char*)p + s);
                     }
                 } else {
+                    self->__M_parse_state.suggested_status_code =
+                        status_code::Content_Too_Large;
                     return -1;
                 }
                 return HPE_OK;
@@ -502,30 +504,33 @@ struct operation
             };
             s.on_headers_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
+                self->__M_parse_state.current_size = 0;
                 if (self->__M_curr_strm) {
                     on<header_complete>(
-                        self->session(),
-                        const_cast<const request_type&>(
-                            self->__M_curr_strm->request),
+                        self->session(), self->__M_curr_strm->request,
                         response_impl(self, self->__M_curr_strm));
                 }
-                return !self->io_cntl.goaway_sent() ? HPE_OK : HPE_PAUSED;
+                return self->io_cntl.want_recv() ? HPE_OK : HPE_PAUSED;
             };
             s.on_message_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
                 self->__M_parse_state.current_size = 0;
                 if (!llhttp_should_keep_alive(c)) {
                     self->shutdown_recv();
+                } else if (self->__M_next_in_stream_id >
+                           self->__M_options->max_stream_id) {
+                    self->shutdown_recv();
                 }
                 if (self->__M_curr_strm) {
-                    self->update_timeout(std::chrono::seconds(0));
+                    self->update_keepalive_timeout(std::chrono::seconds(0));
                     self->set_stream_backend_ddl(self->__M_curr_strm);
                     on<message_complete>(
                         self->session(), self->__M_curr_strm->request,
                         response_impl(self, self->__M_curr_strm));
                 }
-                return self->__M_strms.size() < -1 &&
-                               !self->io_cntl.goaway_sent()
+                return (self->__M_strms.size() <
+                            self->__M_options->max_concurrent_stream &&
+                        self->io_cntl.want_recv())
                            ? HPE_OK
                            : HPE_PAUSED;
             };
@@ -539,12 +544,25 @@ struct operation
 
     net::detail::weak_ptr<h11_stream> __M_curr_strm;
     struct parse_state {
-        std::size_t current_max = 4096;
-        ssize_t current_size = 0;
+        union {
+            ssize_t current_size = 0;
+            http::status_code suggested_status_code;
+        };
     } __M_parse_state;
     llhttp_t __M_parser;
 
     struct {
+        /*
+        http/1.1 io_cntl only has 2 flags: recv and send
+        recv: can read message from socket/can process message from buffer
+        send: can write message to socket/can store message in pending message
+        queue
+
+        goaway removed. we need goaway flag in h2 because we want to make sure
+        GOAWAY frame must be the last frame in pending message queue. however in
+        http/1.1, we do not have a GOAWAY frame, and we always want to recv or
+        send whenever we can.
+        */
         constexpr bool want_recv() const noexcept(true) { return v & 1; }
         constexpr bool want_send() const noexcept(true) { return v & 2; }
         constexpr bool is_sending() const noexcept(true) { return v & 4; }
@@ -555,9 +573,6 @@ struct operation
 
         constexpr void set_recving() noexcept(true) { v |= 8; }
         constexpr void unset_recving() noexcept(true) { v &= ~8; }
-
-        constexpr void send_goaway() noexcept(true) { v |= 16; }
-        constexpr bool goaway_sent() noexcept(true) { return v & 16; }
 
         constexpr void set_feeding() noexcept(true) { v |= 32; }
         constexpr void unset_feeding() noexcept(true) { v &= ~32; }
@@ -576,8 +591,8 @@ struct operation
     void shutdown_recv() noexcept(true) {
         std::error_code e;
         stream().shutdown(stream().shutdown_receive, e);
-        __M_tmr_controller.emit();
-        __M_tmr_controller.clear();
+        __M_keepalive_controller.emit();
+        __M_keepalive_controller.clear();
         io_cntl.shutdown_recv();
     }
     void shutdown_send() noexcept(true) {
@@ -588,8 +603,8 @@ struct operation
     void shutdown_both() noexcept(true) {
         std::error_code e;
         stream().shutdown(stream().shutdown_both, e);
-        __M_tmr_controller.emit();
-        __M_tmr_controller.clear();
+        __M_keepalive_controller.emit();
+        __M_keepalive_controller.clear();
         io_cntl.shutdown_both();
     }
 
@@ -609,7 +624,7 @@ struct operation
     void do_send() {
         if (can_send()) {
             io_cntl.set_sending();
-            update_timeout(std::chrono::seconds(0));
+            update_keepalive_timeout(std::chrono::seconds(0));
             net::async_write_sequence_exactly(
                 stream().lowest_layer(), std::move(__M_pending_response),
                 cntl().template next_with_tag<internal_write>());
@@ -638,22 +653,28 @@ struct operation
                 __M_inbuf_begin = nullptr;
                 return do_read();
             }
-            case HPE_PAUSED:  // user closed the connection
+            case HPE_PAUSED:  // terminate_now() or shutdown_recv() called
             {
-                const char* stop_pos = llhttp_get_error_pos(&__M_parser);
-                __M_inbuf_begin = stop_pos;
-                __M_inbuf_sz = len - (stop_pos - ptr);
-                llhttp_resume(&__M_parser);
                 return;
             }
             case HPE_USER:
-                // something else, and bad request
+                // callbacks returns -1. something else, and bad request
+                if (__M_curr_strm) {
+                    shutdown_recv();
+                    on<ev::request_4xx>(session(), status_code::Bad_Request,
+                                        __M_curr_strm->request,
+                                        response_impl(this, __M_curr_strm));
+                } else {
+                    terminate_now();
+                }
+                return;
             default: {
                 if (__M_curr_strm) {
-                    fields_type fields;
-                    fields.set_field("Server", "chxhttp.h11");
-                    response(__M_curr_strm->self->first,
-                             status_code::Bad_Request, std::move(fields));
+                    shutdown_recv();
+                    on<ev::request_4xx>(session(),
+                                        __M_parse_state.suggested_status_code,
+                                        __M_curr_strm->request,
+                                        response_impl(this, __M_curr_strm));
                 } else {
                     terminate_now();
                 }
@@ -714,6 +735,10 @@ struct operation
                             net::carrier<net::mapped_file> mapped) override {
             __response(code, std::move(fields), std::move(mapped));
         }
+        virtual void do_end(status_code code, fields_type&& fields,
+                            net::vcarrier&& vcarrier) override {
+            __response(code, std::move(fields), std::move(vcarrier));
+        }
 
         virtual const net::ip::tcp::socket* socket() const
             noexcept(true) override {
@@ -748,7 +773,7 @@ struct operation
     };
 };
 template <typename Stream, typename Session, typename FixedTimer>
-operation(Stream&&, Session&&, FixedTimer&) -> operation<
+operation(Stream&&, Session&&, FixedTimer&, const options_t*) -> operation<
     std::conditional_t<std::is_rvalue_reference_v<Stream&&>, Stream, Stream&&>,
     std::conditional_t<std::is_rvalue_reference_v<Session&&>, Session,
                        Session&&>,
@@ -759,15 +784,26 @@ namespace chx::http {
 template <typename Stream, typename SessionFactory, typename CompletionToken>
 decltype(auto) async_http(Stream&& stream, SessionFactory&& session_factory,
                           net::fixed_timer& fixed_timer,
+                          const options_t* options,
                           CompletionToken&& completion_token) {
     using operation_type = decltype(detail::operation(
         std::forward<Stream>(stream),
-        std::forward<SessionFactory>(session_factory)(), fixed_timer));
+        std::forward<SessionFactory>(session_factory)(), fixed_timer, options));
     return net::async_combine_reference_count<const std::error_code&>(
         stream.get_associated_io_context(),
         std::forward<CompletionToken>(completion_token),
         net::detail::type_identity<operation_type>{},
         std::forward<Stream>(stream),
-        std::forward<SessionFactory>(session_factory)(), fixed_timer);
+        std::forward<SessionFactory>(session_factory)(), fixed_timer, options);
+}
+
+template <typename Stream, typename SessionFactory, typename CompletionToken>
+decltype(auto) async_http(Stream&& stream, SessionFactory&& session_factory,
+                          net::fixed_timer& fixed_timer,
+                          CompletionToken&& completion_token) {
+    return async_http(std::forward<Stream>(stream),
+                      std::forward<SessionFactory>(session_factory),
+                      fixed_timer, &default_options,
+                      std::forward<CompletionToken>(completion_token));
 }
 }  // namespace chx::http

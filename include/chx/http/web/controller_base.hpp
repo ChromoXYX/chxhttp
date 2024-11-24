@@ -9,19 +9,17 @@ class controller_base {
   public:
     virtual ~controller_base() = default;
 
-    virtual std::unique_ptr<controller_context_base> create_session() {
-        return {};
+    virtual std::shared_ptr<controller_context_base>
+    on_header_complete(request_type& request) {
+        return nullptr;
     }
-
-    virtual void on_header_complete(controller_context_base* session,
-                                    const request_type& request) {}
-    virtual void on_data_block(controller_context_base* session,
-                               const request_type& request,
-                               const unsigned char* begin,
-                               const unsigned char* end) {}
-    virtual void on_message_complete(controller_context_base* session,
-                                     request_type& request,
-                                     response&& response) = 0;
+    virtual void
+    on_data_block(const std::shared_ptr<controller_context_base>& session,
+                  request_type& request, const unsigned char* begin,
+                  const unsigned char* end) {}
+    virtual void
+    on_message_complete(const std::shared_ptr<controller_context_base>& session,
+                        request_type& request, response&& response) = 0;
 };
 
 template <typename Fn>

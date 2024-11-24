@@ -8,6 +8,8 @@ struct ev {
     struct data_block {};
     struct message_complete {};
 
+    struct request_4xx {};
+
     struct backend_timeout {};
 };
 
