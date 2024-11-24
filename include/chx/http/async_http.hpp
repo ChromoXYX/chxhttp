@@ -159,7 +159,6 @@ struct operation
     net::cancellation_signal
         __M_keepalive_controller;  // keepalive_timeout equals to
                                    // lingering_timeout
-    // net::cancellation_signal __M_backend_controller;
 
     const options_t* const __M_options;
 
@@ -184,20 +183,13 @@ struct operation
     }
 
     using response_variant_t = std::variant<
-        std::tuple<std::string_view, std::string, std::string,
-                   std::string_view>,  // header-only
-        std::tuple<std::string_view, std::string, std::string, std::string_view,
-                   detail::payload_rep,
+        std::tuple<std::string>,  // header-only
+        std::tuple<std::string, detail::payload_rep,
                    std::vector<struct net::iovec_buffer>>,  // with payload
-        std::tuple<std::string_view, std::string, std::string, std::string_view,
-                   std::vector<unsigned char>>,
-        std::tuple<std::string_view, std::string, std::string, std::string_view,
-                   std::vector<net::iovec_buffer>>,
-        std::tuple<std::string_view, std::string, std::string, std::string_view,
-                   std::string_view>,
-        std::string_view,
-        std::tuple<std::string_view, std::string, std::string, std::string_view,
-                   net::vcarrier>>;
+        std::tuple<std::string, std::vector<unsigned char>>,
+        std::tuple<std::string, std::vector<net::iovec_buffer>>,
+        std::tuple<std::string, std::string_view>, std::string_view,
+        std::tuple<std::string, net::vcarrier>>;
     enum __Resp_Var : std::size_t {
         __Resp_HeaderOnly = 0,
         __Resp_Norm = 1,
@@ -232,31 +224,26 @@ struct operation
                             const fields_type& fields, Ts&&... ts) {
         assert(strm_id >= __M_next_out_stream_id &&
                "stream id of response must >= __M_next_stream_id");
-        printf("%lu\n", strm_id);
         if (strm_id == __M_next_out_stream_id) {
             __M_pending_response.emplace_back(
-                std::in_place_index_t<Idx>{}, std::string_view{"HTTP/1.1 "},
-                chx::log::format(CHXLOG_STR("%u %s\r\n"),
+                std::in_place_index_t<Idx>{},
+                chx::log::format(CHXLOG_STR("HTTP/1.1 %u %s\r\n%s\r\n"),
                                  static_cast<unsigned short>(code),
-                                 status_code_name(code)),
-                fields.to_string(), std::string_view{"\r\n"},
+                                 status_code_name(code), fields.to_string()),
                 std::forward<Ts>(ts)...);
             ++__M_next_out_stream_id;
-            printf("send\n");
         } else {
             __M_strms_queue.emplace(
-                strm_id,
-                response_variant_t(
-                    std::in_place_index_t<Idx>{}, std::string_view{"HTTP/1.1 "},
-                    chx::log::format(CHXLOG_STR("%u %s\r\n"),
-                                     static_cast<unsigned short>(code),
-                                     status_code_name(code)),
-                    fields.to_string(), std::string_view{"\r\n"},
-                    std::forward<Ts>(ts)...));
+                strm_id, response_variant_t(
+                             std::in_place_index_t<Idx>{},
+                             chx::log::format(
+                                 CHXLOG_STR("HTTP/1.1 %u %s\r\n%s\r\n"),
+                                 static_cast<unsigned short>(code),
+                                 status_code_name(code), fields.to_string()),
+                             std::forward<Ts>(ts)...));
         }
         while (!__M_strms_queue.empty() &&
                __M_strms_queue.top().first == __M_next_out_stream_id) {
-            printf("send %zu\n", __M_strms_queue.top().first);
             __M_pending_response.emplace_back(std::move(
                 const_cast<response_variant_t&>(__M_strms_queue.top().second)));
             __M_strms_queue.pop();
