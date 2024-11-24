@@ -10,7 +10,6 @@
 
 #include <chx/log.hpp>
 #include <chx/net.hpp>
-#include <map>
 
 namespace chx::http::detail {
 template <typename Event, typename T, typename... Args>
@@ -33,12 +32,14 @@ struct operation
     : net::detail::enable_weak_from_this<operation<Stream, Session, CntlType>> {
     CHXNET_NONCOPYABLE
 
+    operation(operation&&) = delete;
+
     using cntl_type = CntlType;
     template <typename T> using rebind = operation<Stream, Session, T>;
     struct internal_read {};
     struct internal_write {};
     struct internal_timeout {};
-    struct internal_backend_timeout {};
+    // struct internal_backend_timeout {};
 
     template <typename Str, typename Ses, typename Tmr>
     operation(Str&& str, Ses&& ses, Tmr& tmr, const options_t* options)
@@ -120,7 +121,7 @@ struct operation
             // internal_write would never get cancelled, except for
             // terminate_now()
             if (!e) {
-                if (__M_strms.empty() && io_cntl.want_recv()) {
+                if (flying_stream_n() == 0 && io_cntl.want_recv()) {
                     // no pending response, and can still read
                     update_keepalive_timeout(__M_options->keepalive_timeout);
                 }
@@ -151,42 +152,6 @@ struct operation
         }
     }
 
-    template <typename Cntl>
-    void operator()(Cntl& cntl, const std::error_code& e,
-                    internal_backend_timeout) {
-        try {
-            __M_backend_controller.clear();
-            if (!e) {
-                while (!__M_strms.empty() &&
-                       __M_strms.begin()->second.ddl <
-                           std::chrono::steady_clock::now()) {
-                    auto ite = __M_strms.begin();
-                    auto weak_ptr = ite->second.weak_from_this();
-                    on<backend_timeout>(
-                        session(), ite->second.request,
-                        response_impl(this, ite->second.weak_from_this()));
-                    if (weak_ptr) {
-                        __M_strms.erase(ite);
-                    }
-                }
-                if (!__M_strms.empty()) {
-                    __M_tmr.async_register(
-                        __M_strms.begin()->second.ddl,
-                        bind_cancellation_signal(
-                            __M_backend_controller,
-                            cntl.template next_with_tag<
-                                internal_backend_timeout>()));
-                    assert(__M_backend_controller);
-                }
-            }
-            cntl.complete(e);
-        } catch (const std::exception&) {
-            terminate_now();
-            cntl.complete(std::error_code{});
-            std::rethrow_exception(std::current_exception());
-        }
-    }
-
   private:
     Stream __M_stream;
     Session __M_session;
@@ -194,7 +159,7 @@ struct operation
     net::cancellation_signal
         __M_keepalive_controller;  // keepalive_timeout equals to
                                    // lingering_timeout
-    net::cancellation_signal __M_backend_controller;
+    // net::cancellation_signal __M_backend_controller;
 
     const options_t* const __M_options;
 
@@ -243,39 +208,23 @@ struct operation
         __Resp_VCarrier = 6
     };
     std::vector<response_variant_t> __M_pending_response;
-    std::queue<std::pair<std::size_t, response_variant_t>> __M_strms_queue;
+    struct cmp {
+        constexpr bool
+        operator()(const std::pair<std::size_t, response_variant_t>& a,
+                   const std::pair<std::size_t, response_variant_t>& b) const
+            noexcept(true) {
+            return a.first > b.first;
+        }
+    };
+    std::priority_queue<std::pair<std::size_t, response_variant_t>,
+                        std::vector<std::pair<std::size_t, response_variant_t>>,
+                        cmp>
+        __M_strms_queue;
     std::size_t __M_next_in_stream_id = 0;
     std::size_t __M_next_out_stream_id = 0;
 
-    // handle pipelining like what we do in h2 :/
-    struct h11_stream : net::detail::enable_weak_from_this<h11_stream> {
-        using map_type = std::map<std::size_t, h11_stream>;
-        using iterator = typename map_type::iterator;
-
-        iterator self;
-        request_type request;
-        std::chrono::steady_clock::time_point ddl = {};
-    };
-    std::map<std::size_t, h11_stream> __M_strms;
-    h11_stream& create_stream() {
-        auto [ite, c] =
-            __M_strms.emplace(__M_next_in_stream_id++, h11_stream{});
-        assert(c);
-        h11_stream& strm = ite->second;
-        strm.self = ite;
-        return strm;
-    }
-    void set_stream_backend_ddl(const net::detail::weak_ptr<h11_stream>& ptr) {
-        h11_stream& strm = *ptr;
-        strm.ddl = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        if (!__M_backend_controller) {
-            __M_tmr.async_register(
-                strm.ddl,
-                bind_cancellation_signal(
-                    __M_backend_controller,
-                    cntl().template next_with_tag<internal_backend_timeout>()));
-            assert(__M_backend_controller);
-        }
+    constexpr std::size_t flying_stream_n() noexcept(true) {
+        return __M_next_in_stream_id - __M_next_out_stream_id;
     }
 
     template <std::size_t Idx, typename... Ts>
@@ -283,10 +232,6 @@ struct operation
                             const fields_type& fields, Ts&&... ts) {
         assert(strm_id >= __M_next_out_stream_id &&
                "stream id of response must >= __M_next_stream_id");
-        assert(__M_strms.erase(strm_id) == 1);
-        if (__M_strms.empty()) {
-            __M_backend_controller.emit();
-        }
         if (strm_id == __M_next_out_stream_id) {
             __M_pending_response.emplace_back(
                 std::in_place_index_t<Idx>{}, std::string_view{"HTTP/1.1 "},
@@ -308,10 +253,9 @@ struct operation
                     std::forward<Ts>(ts)...));
         }
         while (!__M_strms_queue.empty() &&
-               __M_strms_queue.front().first == __M_next_out_stream_id) {
-            assert(__M_strms.count(__M_strms_queue.front().first) == 0);
-            __M_pending_response.emplace_back(
-                std::move(__M_strms_queue.front().second));
+               __M_strms_queue.top().first == __M_next_out_stream_id) {
+            __M_pending_response.emplace_back(std::move(
+                const_cast<response_variant_t&>(__M_strms_queue.top().second)));
             __M_strms_queue.pop();
             ++__M_next_out_stream_id;
         }
@@ -430,8 +374,8 @@ struct operation
                 self->__M_pbuf.append(p, s);
                 return HPE_OK;
             } else {
-                self->__M_parse_state.suggested_status_code =
-                    http::status_code::URI_Too_Long;
+                self->encountered_error(http::status_code::URI_Too_Long,
+                                        self->__M_next_in_stream_id - 1);
                 return -1;
             }
         }
@@ -439,22 +383,11 @@ struct operation
         constexpr settings_t() {
             s.on_body = [](llhttp_t* c, const char* p, std::size_t s) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                if (self->__M_parse_state.current_size + s <=
-                    self->__M_options->max_payload_size) {
-                    self->__M_parse_state.current_size += s;
-                    if (self->__M_curr_strm) {
-                        on<data_block>(self->session(),
-                                       self->__M_curr_strm->request,
-                                       response_impl(self, self->__M_curr_strm),
-                                       (const unsigned char*)p,
-                                       (const unsigned char*)p + s);
-                    }
-                } else {
-                    self->__M_parse_state.suggested_status_code =
-                        status_code::Content_Too_Large;
-                    return -1;
-                }
-                return HPE_OK;
+                on<data_block>(
+                    self->session(), self->__M_current_request,
+                    response_impl(self, self->__M_next_in_stream_id - 1),
+                    (const unsigned char*)p, (const unsigned char*)p + s);
+                return self->io_cntl.want_recv() ? HPE_OK : HPE_PAUSED;
             };
             s.on_url = consume;
             s.on_header_field = consume;
@@ -462,54 +395,46 @@ struct operation
 
             s.on_method_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                if (self->__M_curr_strm) {
-                    self->__M_curr_strm->request.method =
-                        detail::method_from_h1(llhttp_get_method(c));
-                }
+                self->__M_current_request.method =
+                    detail::method_from_h1(llhttp_get_method(c));
                 return HPE_OK;
             };
             s.on_url_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                if (self->__M_curr_strm) {
-                    self->__M_curr_strm->request.request_target =
-                        std::move(self->__M_pbuf);
-                }
+                self->__M_current_request.request_target =
+                    std::move(self->__M_pbuf);
                 self->__M_pbuf.clear();
                 return HPE_OK;
             };
             s.on_header_field_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                if (self->__M_curr_strm) {
-                    self->__M_curr_strm->request.fields.emplace_back(
-                        std::move(self->__M_pbuf));
-                }
+                self->__M_current_request.fields.emplace_back(
+                    std::move(self->__M_pbuf));
                 self->__M_pbuf.clear();
                 return HPE_OK;
             };
             s.on_header_value_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                if (self->__M_curr_strm) {
-                    self->__M_curr_strm->request.fields.back().second =
-                        std::move(self->__M_pbuf);
-                }
+                self->__M_current_request.fields.back().second =
+                    std::move(self->__M_pbuf);
                 self->__M_pbuf.clear();
                 return HPE_OK;
             };
 
             s.on_message_begin = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                self->__M_curr_strm = self->create_stream().weak_from_this();
+                ++self->__M_next_in_stream_id;
+                self->__M_parse_state = {};
+                self->__M_current_request = {};
                 on<message_start>(self->session(), *self);
                 return HPE_OK;
             };
             s.on_headers_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
                 self->__M_parse_state.current_size = 0;
-                if (self->__M_curr_strm) {
-                    on<header_complete>(
-                        self->session(), self->__M_curr_strm->request,
-                        response_impl(self, self->__M_curr_strm));
-                }
+                on<header_complete>(
+                    self->session(), self->__M_current_request,
+                    response_impl(self, self->__M_next_in_stream_id - 1));
                 return self->io_cntl.want_recv() ? HPE_OK : HPE_PAUSED;
             };
             s.on_message_complete = [](llhttp_t* c) -> int {
@@ -521,14 +446,11 @@ struct operation
                            self->__M_options->max_stream_id) {
                     self->shutdown_recv();
                 }
-                if (self->__M_curr_strm) {
-                    self->update_keepalive_timeout(std::chrono::seconds(0));
-                    self->set_stream_backend_ddl(self->__M_curr_strm);
-                    on<message_complete>(
-                        self->session(), self->__M_curr_strm->request,
-                        response_impl(self, self->__M_curr_strm));
-                }
-                return (self->__M_strms.size() <
+                self->update_keepalive_timeout(std::chrono::seconds(0));
+                on<message_complete>(
+                    self->session(), self->__M_current_request,
+                    response_impl(self, self->__M_next_in_stream_id - 1));
+                return (self->flying_stream_n() <
                             self->__M_options->max_concurrent_stream &&
                         self->io_cntl.want_recv())
                            ? HPE_OK
@@ -542,13 +464,14 @@ struct operation
     std::size_t __M_inbuf_sz = 0;
     std::string __M_pbuf;
 
-    net::detail::weak_ptr<h11_stream> __M_curr_strm;
+    // net::detail::weak_ptr<h11_stream> __M_curr_strm;
+    // net::detail::main_anchor<h11_stream> __M_curr_strm_anchor;
     struct parse_state {
         union {
             ssize_t current_size = 0;
-            http::status_code suggested_status_code;
         };
     } __M_parse_state;
+    request_type __M_current_request = {};
     llhttp_t __M_parser;
 
     struct {
@@ -609,7 +532,7 @@ struct operation
     }
 
     void do_read() {
-        if (can_read()) {
+        if (io_cntl.want_recv() && !io_cntl.is_recving()) {
             if (__M_inbuf_sz == 0) {
                 io_cntl.set_recving();
                 stream().lowest_layer().async_read_some(
@@ -622,7 +545,8 @@ struct operation
     }
 
     void do_send() {
-        if (can_send()) {
+        if (io_cntl.want_send() && !io_cntl.is_sending() &&
+            !__M_pending_response.empty()) {
             io_cntl.set_sending();
             update_keepalive_timeout(std::chrono::seconds(0));
             net::async_write_sequence_exactly(
@@ -631,12 +555,20 @@ struct operation
         }
     }
 
+    void encountered_error(status_code code, std::size_t strm_id) {
+        shutdown_recv();
+        on<ev::request_4xx>(session(), code, __M_current_request,
+                            response_impl(this, strm_id));
+    }
+
     // 24.08.19 found it hard to understand feed(), so made feed2() :(
     // 24.08.23 i think it would be better for os to manage pipelining message,
     // not chxhttp :), so do_read() and do_send() should be called by response.
     // but pending_response is still useful.
     void feed2(const char* ptr, std::size_t len) {
-        if (can_read() && !io_cntl.is_feeding()) {
+        if (flying_stream_n() < __M_options->max_concurrent_stream &&
+            io_cntl.want_recv() && !io_cntl.is_recving() &&
+            !io_cntl.is_feeding()) {
             struct guard_t {
                 constexpr guard_t(operation* o) : oper(o) {
                     oper->io_cntl.set_feeding();
@@ -653,43 +585,23 @@ struct operation
                 __M_inbuf_begin = nullptr;
                 return do_read();
             }
-            case HPE_PAUSED:  // terminate_now() or shutdown_recv() called
+            case HPE_PAUSED:  // session want to pause, or too many strm
             {
+                const char* stop_pos = llhttp_get_error_pos(&__M_parser);
+                assert(stop_pos >= ptr);
+                __M_inbuf_begin = stop_pos;
+                __M_inbuf_sz = len - (stop_pos - ptr);
+                llhttp_resume(&__M_parser);
                 return;
             }
-            case HPE_USER:
-                // callbacks returns -1. something else, and bad request
-                if (__M_curr_strm) {
-                    shutdown_recv();
-                    on<ev::request_4xx>(session(), status_code::Bad_Request,
-                                        __M_curr_strm->request,
-                                        response_impl(this, __M_curr_strm));
-                } else {
-                    terminate_now();
-                }
+            case HPE_USER:  // callbacks returns -1
                 return;
             default: {
-                if (__M_curr_strm) {
-                    shutdown_recv();
-                    on<ev::request_4xx>(session(),
-                                        __M_parse_state.suggested_status_code,
-                                        __M_curr_strm->request,
-                                        response_impl(this, __M_curr_strm));
-                } else {
-                    terminate_now();
-                }
+                encountered_error(status_code::Bad_Request,
+                                  __M_next_in_stream_id - 1);
             }
             }
         }
-    }
-
-    constexpr bool can_read() noexcept(true) {
-        return __M_strms.size() < -1 && io_cntl.want_recv() &&
-               !io_cntl.is_recving();
-    }
-    constexpr bool can_send() noexcept(true) {
-        return io_cntl.want_send() && !io_cntl.is_sending() &&
-               !__M_pending_response.empty();
     }
 
     class response_impl : public response {
@@ -709,7 +621,7 @@ struct operation
         }
 
         virtual bool get_guard() const noexcept(true) override {
-            return __M_p && __M_p->get_guard() && __M_strm;
+            return self && self->get_guard();
         }
 
         virtual void do_end(status_code code, fields_type&& fields) override {
@@ -742,32 +654,30 @@ struct operation
 
         virtual const net::ip::tcp::socket* socket() const
             noexcept(true) override {
-            return __M_p ? &__M_p->stream() : nullptr;
+            return self ? &self->stream() : nullptr;
         }
         virtual void terminate() override {
-            if (__M_p) {
-                __M_p->terminate_now();
+            if (self) {
+                self->terminate_now();
             }
         }
         virtual net::io_context* get_associated_io_context() const
             noexcept(true) override {
-            return __M_p ? &__M_p->cntl().get_associated_io_context() : nullptr;
+            return self ? &self->cntl().get_associated_io_context() : nullptr;
         }
 
       private:
-        constexpr response_impl(
-            operation* self,
-            const net::detail::weak_ptr<h11_stream>& strm_ptr) noexcept(true)
-            : __M_p(self->weak_from_this()), __M_strm(strm_ptr) {}
+        constexpr response_impl(operation* s, std::size_t id) noexcept(true)
+            : self(s->weak_from_this()), strm_id(id) {}
 
-        net::detail::weak_ptr<operation> __M_p;
-        net::detail::weak_ptr<h11_stream> __M_strm;
+        net::detail::weak_ptr<operation> self;
+        const std::size_t strm_id;
 
         template <typename... Ts>
         void __response(status_code code, fields_type&& fields, Ts&&... ts) {
             if (get_guard()) {
-                __M_p->response(__M_strm->self->first, code, std::move(fields),
-                                std::forward<Ts>(ts)...);
+                self->response(strm_id, code, std::move(fields),
+                               std::forward<Ts>(ts)...);
             }
         }
     };

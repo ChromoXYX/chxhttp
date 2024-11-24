@@ -11,7 +11,7 @@ template <typename Dispatcher> struct dispatcher_session {
     constexpr dispatcher_session(dispatcher_session&& other) noexcept(true) =
         default;
 
-    void operator()(header_complete, request_type& request, response&& resp) {
+    void operator()(header_complete, request_type& request, response&&) {
         assert(uv.index() == 0);
         auto [preferred_, controller] = self->get(request);
         if (controller) {
@@ -23,12 +23,11 @@ template <typename Dispatcher> struct dispatcher_session {
                 uv.template emplace<3>(std::current_exception());
             }
         } else {
-            // u.deferred_error = preferred_;
             uv.template emplace<2>(preferred_);
         }
     }
 
-    void operator()(data_block, request_type& request, response&& resp,
+    void operator()(data_block, request_type& request, response&&,
                     const unsigned char* begin, const unsigned char* end) {
         if (auto* p = std::get_if<1>(&uv); p) {
             try {
