@@ -10,13 +10,13 @@ class controller_base {
     virtual ~controller_base() = default;
 
     virtual std::shared_ptr<controller_context_base>
-    on_header_complete(request_type& request) {
+    on_header_complete(request_type& request, response& resp) {
         return nullptr;
     }
     virtual void
     on_data_block(const std::shared_ptr<controller_context_base>& session,
-                  request_type& request, const unsigned char* begin,
-                  const unsigned char* end) {}
+                  request_type& request, response& resp,
+                  const unsigned char* begin, const unsigned char* end) {}
     virtual void
     on_message_complete(const std::shared_ptr<controller_context_base>& session,
                         request_type& request, response&& response) = 0;

@@ -21,10 +21,15 @@ class response {
         }
     }
 
-    virtual net::io_context* get_associated_io_context() const
-        noexcept(true) = 0;
     virtual const net::ip::tcp::socket* socket() const noexcept(true) = 0;
-    virtual void terminate() = 0;
+
+    void pause() { do_pause(); }
+    void resume() { do_resume(); }
+    void terminate() { do_terminate(); }
+
+    virtual net::io_context& get_associated_io_context() const {
+        return do_get_associated_io_context();
+    }
 
     template <typename... Ts>
     void end(status_code code, fields_type&& fields, Ts&&... ts);
@@ -43,6 +48,12 @@ class response {
                         net::carrier<net::mapped_file> mapped) = 0;
     virtual void do_end(status_code code, fields_type&& fields,
                         net::vcarrier&& vc) = 0;
+
+    virtual void do_terminate() = 0;
+    virtual void do_pause() = 0;
+    virtual void do_resume() = 0;
+
+    virtual net::io_context& do_get_associated_io_context() const = 0;
 
     struct can_do_end_directly;
 };

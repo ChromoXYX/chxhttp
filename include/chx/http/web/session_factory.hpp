@@ -11,13 +11,13 @@ template <typename Dispatcher> struct dispatcher_session {
     constexpr dispatcher_session(dispatcher_session&& other) noexcept(true) =
         default;
 
-    void operator()(header_complete, request_type& request, response&&) {
+    void operator()(header_complete, request_type& request, response&& resp) {
         assert(uv.index() == 0);
         auto [preferred_, controller] = self->get(request);
         if (controller) {
             try {
                 std::shared_ptr session_storage =
-                    controller->on_header_complete(request);
+                    controller->on_header_complete(request, resp);
                 uv.template emplace<1>(controller, session_storage);
             } catch (const std::exception&) {
                 uv.template emplace<3>(std::current_exception());
@@ -27,11 +27,11 @@ template <typename Dispatcher> struct dispatcher_session {
         }
     }
 
-    void operator()(data_block, request_type& request, response&&,
+    void operator()(data_block, request_type& request, response&& resp,
                     const unsigned char* begin, const unsigned char* end) {
         if (auto* p = std::get_if<1>(&uv); p) {
             try {
-                p->first->on_data_block(p->second, request, begin, end);
+                p->first->on_data_block(p->second, request, resp, begin, end);
             } catch (const std::exception&) {
                 uv.template emplace<3>(std::current_exception());
             }

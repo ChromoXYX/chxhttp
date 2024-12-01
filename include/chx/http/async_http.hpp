@@ -425,7 +425,9 @@ struct operation
                 on<header_complete>(
                     self->session(), self->__M_current_request,
                     response_impl(self, self->__M_next_in_stream_id - 1));
-                return self->io_cntl.want_recv() ? HPE_OK : HPE_PAUSED;
+                return !self->should_pause() && self->io_cntl.want_recv()
+                           ? HPE_OK
+                           : HPE_PAUSED;
             };
             s.on_message_complete = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
@@ -460,7 +462,11 @@ struct operation
         union {
             ssize_t current_size = 0;
         };
+        std::size_t pause_vote = 0;
     } __M_parse_state;
+    constexpr bool should_pause() noexcept(true) {
+        return __M_parse_state.pause_vote;
+    }
     request_type __M_current_request = {};
     llhttp_t __M_parser;
 
@@ -522,7 +528,7 @@ struct operation
     }
 
     void do_read() {
-        if (io_cntl.want_recv() && !io_cntl.is_recving()) {
+        if (!should_pause() && io_cntl.want_recv() && !io_cntl.is_recving()) {
             if (__M_inbuf_sz == 0) {
                 io_cntl.set_recving();
                 stream().lowest_layer().async_read_some(
@@ -556,7 +562,8 @@ struct operation
     // not chxhttp :), so do_read() and do_send() should be called by response.
     // but pending_response is still useful.
     void feed2(const char* ptr, std::size_t len) {
-        if (flying_stream_n() < __M_options->max_concurrent_stream &&
+        if (!should_pause() &&
+            flying_stream_n() < __M_options->max_concurrent_stream &&
             io_cntl.want_recv() && !io_cntl.is_recving() &&
             !io_cntl.is_feeding()) {
             struct guard_t {
@@ -646,17 +653,23 @@ struct operation
             noexcept(true) override {
             return self ? &self->stream() : nullptr;
         }
-        virtual void terminate() override {
+
+      private:
+        virtual void do_terminate() override {
             if (self) {
                 self->terminate_now();
             }
         }
-        virtual net::io_context* get_associated_io_context() const
-            noexcept(true) override {
-            return self ? &self->cntl().get_associated_io_context() : nullptr;
+        virtual void do_pause() override { ++self->__M_parse_state.pause_vote; }
+        virtual void do_resume() override {
+            assert(self->__M_parse_state.pause_vote);
+            --self->__M_parse_state.pause_vote;
         }
 
-      private:
+        virtual net::io_context& do_get_associated_io_context() const override {
+            return self->cntl().get_associated_io_context();
+        }
+
         constexpr response_impl(operation* s, std::size_t id) noexcept(true)
             : self(s->weak_from_this()), strm_id(id) {}
 
