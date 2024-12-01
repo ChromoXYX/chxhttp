@@ -184,7 +184,7 @@ struct operation
 
     using response_variant_t = std::variant<
         std::tuple<std::string>,  // header-only
-        std::tuple<std::string, detail::payload_rep,
+        std::tuple<std::string, detail::payload_storage_wrapper,
                    std::vector<struct net::iovec_buffer>>,  // with payload
         std::tuple<std::string, std::vector<unsigned char>>,
         std::tuple<std::string, std::vector<net::iovec_buffer>>,
@@ -274,7 +274,7 @@ struct operation
     void __response_multi(std::size_t strm_id, status_code code,
                           const fields_type& fields, Ts&&... ts) {
         std::unique_ptr store =
-            detail::payload_store::create(std::forward<Ts>(ts)...);
+            detail::payload_storage::create(std::forward<Ts>(ts)...);
         std::vector<net::iovec_buffer> iov =
             detail::create_iovec_vector(store->data);
         __response_emplace<1>(strm_id, code, fields, std::move(store),

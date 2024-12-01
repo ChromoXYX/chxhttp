@@ -276,8 +276,8 @@ struct operation : net::detail::enable_weak_from_this<
 
     std::vector<unsigned char> __M_buf;
 
-    using payload_rep = http::detail::payload_rep;
-    using payload_store = http::detail::payload_store;
+    using payload_rep = http::detail::payload_storage_wrapper;
+    using payload_store = http::detail::payload_storage;
     using payload_monostate = http::detail::payload_monostate;
     using payload_variant =
         std::variant<std::tuple<payload_rep, std::vector<net::iovec_buffer>>,
@@ -292,7 +292,7 @@ struct operation : net::detail::enable_weak_from_this<
                                       std::unique_ptr<T> store) {
         std::tuple<payload_rep, std::vector<net::iovec_buffer>> tp(
             payload_rep{}, http::detail::create_iovec_vector(store->data));
-        std::get<0>(tp).payload.reset(store.release());
+        std::get<0>(tp).payload = std::move(store);
         return v.emplace_back(
             std::move(header),
             payload_variant(std::in_place_index_t<0>{}, std::move(tp)));
@@ -1481,7 +1481,7 @@ struct operation : net::detail::enable_weak_from_this<
                 std::get<0>(pending_frames.back())[4] =
                     flags | Flags::END_HEADERS;
                 std::get<0>(std::get<0>(std::get<1>(pending_frames.back())))
-                    .payload.reset(store.release());
+                    .payload = std::move(store);
             }
             if (flags & Flags::END_STREAM) {
                 send_ES_lifecycle(strm.self_pos);

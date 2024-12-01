@@ -8,7 +8,7 @@ namespace chx::http::h2::detail {
 struct data_task_t {
     flags_t flags = 0;
     std::size_t sz = 0;
-    std::unique_ptr<http::detail::payload_store> payload;
+    std::unique_ptr<http::detail::payload_storage> payload;
     std::vector<net::iovec_buffer> iovec;
 
     template <typename... Ts>
@@ -17,7 +17,7 @@ struct data_task_t {
         task.flags = flags;
 
         std::unique_ptr payload =
-            http::detail::payload_store::create(std::forward<Ts>(ts)...);
+            http::detail::payload_storage::create(std::forward<Ts>(ts)...);
         task.iovec = http::detail::create_iovec_vector(payload->data);
         task.sz = std::accumulate(
             task.iovec.begin(), task.iovec.end(), std::size_t{0},

@@ -7,11 +7,11 @@
 #include <chx/net/iovec_buffer.hpp>
 
 namespace chx::http::detail {
-struct payload_store {
-    virtual ~payload_store() = default;
+struct payload_storage {
+    virtual ~payload_storage() = default;
 
     template <typename... Ts> auto static create(Ts&&... ts) {
-        struct impl : payload_store {
+        struct impl : payload_storage {
             impl(impl&&) = default;
             impl(Ts&&... ts) : data(std::forward<Ts>(ts)...) {}
 
@@ -24,15 +24,15 @@ struct payload_store {
         return std::make_unique<impl>(std::forward<Ts>(ts)...);
     }
 };
-struct payload_rep {
-    payload_rep() = default;
-    payload_rep(payload_rep&&) = default;
+struct payload_storage_wrapper {
+    payload_storage_wrapper() = default;
+    payload_storage_wrapper(payload_storage_wrapper&&) = default;
     template <typename T>
-    payload_rep(std::unique_ptr<T> ptr) : payload(std::move(ptr)) {}
+    payload_storage_wrapper(std::unique_ptr<T> ptr) : payload(std::move(ptr)) {}
 
-    payload_rep& operator=(payload_rep&&) = default;
+    payload_storage_wrapper& operator=(payload_storage_wrapper&&) = default;
 
-    std::unique_ptr<payload_store> payload;
+    std::unique_ptr<payload_storage> payload;
 
     using value_type = unsigned char;
     constexpr const value_type* data() const noexcept(true) { return nullptr; }
