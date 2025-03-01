@@ -171,8 +171,12 @@ class middleware_controller : public controller_base {
         }
 
         constexpr action_result& result() noexcept(true) { return env.p.r; }
-        constexpr std::span<const unsigned char> payload() noexcept(true) {
-            return {env.p.d.begin, env.p.d.end};
+        std::span<const unsigned char> payload() noexcept(true) {
+            if (env.p.d.callback) {
+                return {env.p.d.begin, env.p.d.end};
+            } else {
+                return {};
+            }
         }
     };
 };
