@@ -3,16 +3,70 @@
 #include "./status_code.hpp"
 #include "./header.hpp"
 #include "./session_closed.hpp"
+#include <chx/net/detail/monostate_container.hpp>
 #include <chx/net/tcp.hpp>
 #include <chx/net/utility.hpp>
+#include <variant>
 
 namespace chx::http {
-class response {
-  public:
-    virtual ~response() = default;
 
-    virtual std::shared_ptr<response> make_shared() const = 0;
-    virtual std::unique_ptr<response> make_unique() const = 0;
+class action_result {
+    friend class response_type;
+
+    using payload_type =
+        std::variant<net::detail::monostate_container, net::const_buffer,
+                     std::string, std::vector<unsigned char>,
+                     std::vector<std::vector<unsigned char>>, net::mapped_file,
+                     net::carrier<net::mapped_file>, net::vcarrier>;
+
+  protected:
+    status_code __M_code = status_code::OK;
+    fields_type __M_fields;
+    payload_type __M_payload;
+
+  public:
+    action_result() = default;
+
+    action_result(status_code code) : action_result(code, fields_type{}) {}
+    action_result(status_code code, fields_type fields)
+        : __M_code(code), __M_fields(std::move(fields)) {}
+
+    template <typename T>
+    action_result(status_code code, T t)
+        : action_result(code, fields_type{}, std::move(t)) {}
+    template <typename T>
+    action_result(status_code code, fields_type fields, T t)
+        : __M_code(code), __M_fields(std::move(fields)),
+          __M_payload(std::move(t)) {}
+
+    template <typename CharT, typename Traits>
+    action_result(status_code code, fields_type fields,
+                  std::basic_string_view<CharT, Traits> t)
+        : __M_code(code), __M_fields(std::move(fields)),
+          __M_payload(net::buffer(t)) {}
+
+    template <typename CharT, std::size_t N,
+              typename = std::void_t<std::enable_if_t<sizeof(CharT) == 1>>>
+    action_result(status_code code, fields_type fields, CharT p[N])
+        : action_result(code, std::move(fields), std::basic_string_view{p}) {}
+
+    constexpr status_code code() const noexcept(true) { return __M_code; }
+    constexpr fields_type& fields() noexcept(true) { return __M_fields; }
+    constexpr const fields_type& fields() const noexcept(true) {
+        return __M_fields;
+    }
+    constexpr payload_type& payload() noexcept(true) { return __M_payload; }
+    constexpr const payload_type& payload() const noexcept(true) {
+        return __M_payload;
+    }
+};
+
+class response_type {
+  public:
+    virtual ~response_type() = default;
+
+    virtual std::shared_ptr<response_type> make_shared() const = 0;
+    virtual std::unique_ptr<response_type> make_unique() const = 0;
 
     virtual bool get_guard() const noexcept(true) = 0;
     virtual void guard() const {
@@ -20,6 +74,8 @@ class response {
             throw session_closed{};
         }
     }
+
+    bool expired() const noexcept(true) { return do_expired(); }
 
     virtual const net::ip::tcp::socket* socket() const noexcept(true) = 0;
 
@@ -31,17 +87,123 @@ class response {
         return do_get_associated_io_context();
     }
 
-    template <typename... Ts>
-    void end(status_code code, fields_type&& fields, Ts&&... ts);
+    // bool would_block() const noexcept(true) { return do_would_block(); }
+
+    class stream_type {
+        friend response_type;
+        response_type& __M_self;
+
+        status_code __M_status_code;
+        fields_type __M_fields;
+        std::queue<std::vector<unsigned char>> __M_buf;
+
+        bool __M_started = false;
+
+        stream_type(response_type& self) noexcept(true) : __M_self(self) {}
+
+        void flush() {
+            if (!__M_started && !__M_self.do_streaming_would_block()) {
+                __M_started = true;
+                __M_self.do_streaming_flush_header(__M_status_code,
+                                                   std::move(__M_fields));
+                while (!__M_buf.empty()) {
+                    __M_self.do_streaming_flush(std::move(__M_buf.front()));
+                    __M_buf.pop();
+                }
+            }
+        }
+
+      public:
+        stream_type& set_status_code(status_code c) {
+            __M_status_code = c;
+            return *this;
+        }
+
+        stream_type& set_fields(fields_type&& fields) {
+            __M_fields = std::move(fields);
+            if (!__M_self.do_streaming_would_block()) {
+                __M_self.do_streaming_flush_header(__M_status_code,
+                                                   std::move(__M_fields));
+                __M_started = true;
+            }
+            return *this;
+        }
+
+        stream_type& write(std::vector<unsigned char> buffer) {
+            if (__M_started) {
+                __M_self.do_streaming_flush(std::move(buffer));
+            } else {
+                __M_buf.push(std::move(buffer));
+                flush();
+            }
+            return *this;
+        }
+        stream_type& write(std::string str) {
+            return write(std::vector<unsigned char>(str.begin(), str.end()));
+        }
+
+        void commit() {
+            flush();
+            if (!__M_started) {
+                std::vector<std::vector<unsigned char>> b;
+                b.reserve(__M_buf.size());
+                while (!__M_buf.empty()) {
+                    b.push_back(std::move(__M_buf.front()));
+                    __M_buf.pop();
+                }
+                __M_self.do_end(__M_status_code, std::move(__M_fields),
+                                std::move(b));
+            } else {
+                __M_self.do_streaming_commit();
+            }
+        }
+    };
+
+    stream_type stream() noexcept(true) { return {*this}; }
+
+    void end(status_code code, fields_type&& fields) {
+        try {
+            do_end(code, std::move(fields));
+        } catch (const std::exception&) {
+            net::rethrow_with_fatal(std::current_exception());
+        }
+    }
+
+    template <typename T> void end(status_code code, fields_type fields, T t) {
+        try {
+            do_end(code, std::move(fields), std::move(t));
+        } catch (const std::exception&) {
+            net::rethrow_with_fatal(std::current_exception());
+        }
+    }
+
+    void end(action_result result) {
+        std::visit(
+            [&](auto& a) {
+                if constexpr (std::is_same_v<
+                                  std::decay_t<decltype(a)>,
+                                  net::detail::monostate_container>) {
+                    end(result.__M_code, std::move(result.__M_fields));
+                } else {
+                    end(result.__M_code, std::move(result.__M_fields),
+                        std::move(a));
+                }
+            },
+            result.payload());
+    }
 
   private:
+    virtual bool do_expired() const noexcept(true) = 0;
+
     virtual void do_end(status_code code, fields_type&& fields) = 0;
     virtual void do_end(status_code code, fields_type&& fields,
-                        std::string_view payload) = 0;
+                        net::const_buffer view) = 0;
     virtual void do_end(status_code code, fields_type&& fields,
                         std::string payload) = 0;
     virtual void do_end(status_code code, fields_type&& fields,
                         std::vector<unsigned char> payload) = 0;
+    virtual void do_end(status_code code, fields_type&& fields,
+                        std::vector<std::vector<unsigned char>> payload) = 0;
     virtual void do_end(status_code code, fields_type&& fields,
                         net::mapped_file mapped) = 0;
     virtual void do_end(status_code code, fields_type&& fields,
@@ -53,30 +215,14 @@ class response {
     virtual void do_pause() = 0;
     virtual void do_resume() = 0;
 
+    virtual bool do_streaming_would_block() noexcept(true) = 0;
+    // return 0 or positive for bytes pushed
+    virtual std::size_t do_streaming_flush_header(status_code code,
+                                                  fields_type&& fields) = 0;
+    virtual std::size_t
+    do_streaming_flush(std::vector<unsigned char>&& buffer) = 0;
+    virtual void do_streaming_commit() = 0;
+
     virtual net::io_context& do_get_associated_io_context() const = 0;
-
-    struct can_do_end_directly;
 };
-
-struct response::can_do_end_directly {
-    template <typename... Ts,
-              typename = decltype(std::declval<response>().do_end(
-                  std::declval<status_code>(), std::declval<fields_type>(),
-                  std::declval<Ts&&>()...))>
-    can_do_end_directly(Ts&&...);
-};
-
-template <typename... Ts>
-void response::end(status_code code, fields_type&& fields, Ts&&... ts) {
-    try {
-        if constexpr (std::is_constructible_v<can_do_end_directly, Ts&&...>) {
-            do_end(code, std::move(fields), std::forward<Ts>(ts)...);
-        } else {
-            do_end(code, std::move(fields),
-                   net::vcarrier::create(std::forward<Ts>(ts)...));
-        }
-    } catch (const std::exception&) {
-        net::rethrow_with_fatal(std::current_exception());
-    }
-}
 }  // namespace chx::http

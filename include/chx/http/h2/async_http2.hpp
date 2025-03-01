@@ -11,7 +11,6 @@
 #include "../header.hpp"
 #include "../detail/payload.hpp"
 #include "./detail/stream_states.hpp"
-#include "./detail/data_task.hpp"
 #include "./detail/h2_stream.hpp"
 #include "./detail/frame.hpp"
 #include "../status_code.hpp"
@@ -227,6 +226,7 @@ struct operation : net::detail::enable_weak_from_this<
     }
     void complete_with_goaway(const std::error_code& e,
                               ErrorCodes h2_ec = ErrorCodes::NO_ERROR) {
+        settings_ack_timeout.emit();
         if (cntl().tracked_task_empty()) {
             create_GOAWAY_frame(h2_ec);
         }
@@ -279,92 +279,28 @@ struct operation : net::detail::enable_weak_from_this<
     using payload_rep = http::detail::payload_storage_wrapper;
     using payload_store = http::detail::payload_storage;
     using payload_monostate = http::detail::payload_monostate;
+
     using payload_variant =
-        std::variant<std::tuple<payload_rep, std::vector<net::iovec_buffer>>,
-                     std::vector<unsigned char>, payload_monostate,
-                     std::array<unsigned char, 8>>;
+        std::variant<payload_monostate, std::vector<unsigned char>,
+                     std::array<unsigned char, 8>, net::const_buffer,
+                     std::array<unsigned char, 4>,
+                     //
+                     net::offset_carrier<net::const_buffer>,
+                     net::offset_carrier<std::string>,
+                     net::offset_carrier<std::vector<unsigned char>>,
+                     net::carrier<net::mapped_file>,
+                     net::offset_carrier<net::vcarrier>>;
+    enum __Payload {
+        __Payload_Empty = 0,
+        __Payload_Vector = 1,
+        __Payload_Array8 = 2,
+        __Payload_ConstBuffer = 3,
+        __Payload_OffsetCarrierVector = 7
+    };
     using pending_frame_type =
         std::tuple<std::array<unsigned char, 9>, payload_variant>;
-    template <typename T>
-    static auto&
-    __pending_frame_type_emplace_back(std::vector<pending_frame_type>& v,
-                                      std::array<unsigned char, 9>&& header,
-                                      std::unique_ptr<T> store) {
-        std::tuple<payload_rep, std::vector<net::iovec_buffer>> tp(
-            payload_rep{}, http::detail::create_iovec_vector(store->data));
-        std::get<0>(tp).payload = std::move(store);
-        return v.emplace_back(
-            std::move(header),
-            payload_variant(std::in_place_index_t<0>{}, std::move(tp)));
-    }
-
-    static auto&
-    __pending_frame_type_emplace_back(std::vector<pending_frame_type>& v,
-                                      std::array<unsigned char, 9>&& header,
-                                      payload_rep rep,
-                                      std::vector<net::iovec_buffer>&& iov) {
-        return v.emplace_back(std::move(header),
-                              payload_variant(std::in_place_index_t<0>{},
-                                              std::move(rep), std::move(iov)));
-    }
-    static auto&
-    __pending_frame_type_emplace_back(std::vector<pending_frame_type>& v,
-                                      std::array<unsigned char, 9>&& header,
-                                      std::vector<unsigned char>&& iov) {
-        return v.emplace_back(
-            std::move(header),
-            payload_variant(std::in_place_index_t<1>{}, std::move(iov)));
-    }
-    static auto&
-    __pending_frame_type_emplace_back(std::vector<pending_frame_type>& v,
-                                      std::array<unsigned char, 9>&& header) {
-        return v.emplace_back(std::move(header),
-                              payload_variant(std::in_place_index_t<2>{}));
-    }
-    static auto& __pending_frame_type_emplace_back(
-        std::vector<pending_frame_type>& v,
-        std::array<unsigned char, 9>&& header,
-        std::array<unsigned char, 8>&& ping_payload) {
-        return v.emplace_back(std::move(header),
-                              payload_variant(std::in_place_index_t<3>{},
-                                              std::move(ping_payload)));
-    }
     std::vector<pending_frame_type> pending_frames;
-    template <typename... Ts>
-    constexpr void
-    pending_frames_emplace_back(std::array<unsigned char, 9>&& header,
-                                Ts&&... ts) {
-        __pending_frame_type_emplace_back(pending_frames, std::move(header),
-                                          std::forward<Ts>(ts)...);
-    }
-    [[nodiscard]] std::vector<net::iovec_buffer>
-    iovec_generator(std::vector<net::iovec_buffer>& iov, std::size_t s,
-                    std::size_t* n = nullptr) {
-        std::vector<net::iovec_buffer> _r;
-        std::size_t cur = 0;
-        while (cur < s && !iov.empty()) {
-            // assert(!iov.empty());
-            const std::size_t remain = s - cur;
-            if (iov.front().iov_len <= remain) {
-                cur += iov.front().iov_len;
-                _r.push_back(std::move(iov.front()));
-                iov.erase(iov.begin());
-            } else {
-                cur += remain;
-                // if iov_len > remain, it must be the last (?)
-                assert(cur == s);
-                net::iovec_buffer a = iov.front(), &b = iov.front();
-                a.iov_len = remain;
-                b.iov_base = (unsigned char*)b.iov_base + remain;
-                b.iov_len -= remain;
-                _r.push_back(std::move(a));
-            }
-        }
-        if (n) {
-            *n = cur;
-        }
-        return std::move(_r);
-    }
+
     std::array<unsigned char, 9>
     create_frame_header_helper(FrameType ft, std::size_t len, flags_t flags,
                                stream_id_t strm_id) noexcept(true) {
@@ -855,7 +791,12 @@ struct operation : net::detail::enable_weak_from_this<
                     *std::get_if<DataTail>(&__M_state);
                 if (ParseResult r = parser(begin, end); r == ParseSuccess) {
                     // tail, data frame complete
-                    if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
+                    const length_t len = current_frame.length;
+                    if (ErrorCodes r = reset_fsm();
+                        r == ErrorCodes::NO_ERROR && !len ||
+                        (r = create_WINDOW_UPDATE_frame_conn(len)) ==
+                            ErrorCodes::NO_ERROR) {
+                        do_send();
                         break;
                     } else {
                         return r;
@@ -1095,7 +1036,7 @@ struct operation : net::detail::enable_weak_from_this<
                             h2_strm& strm = ite->second;
                             auto cur = ite++;
                             if (!strm.pending_DATA_tasks.empty()) {
-                                create_DATA_flush2(cur);
+                                create_DATA_flush3(cur);
                             }
                         }
                     } else if (current_frame.strm) {
@@ -1106,7 +1047,7 @@ struct operation : net::detail::enable_weak_from_this<
                             return ErrorCodes::PROTOCOL_ERROR;
                         }
                         strm.server_wnd += upd;
-                        create_DATA_flush2(strm.self_pos);
+                        create_DATA_flush3(strm.self_pos);
                     }
                     if (ErrorCodes r = reset_fsm(); r == ErrorCodes::NO_ERROR) {
                         break;
@@ -1265,9 +1206,9 @@ struct operation : net::detail::enable_weak_from_this<
     }
 
     ErrorCodes create_PING_ACK_frame(std::array<unsigned char, 8>&& data) {
-        pending_frames_emplace_back(
+        pending_frames.emplace_back(
             create_frame_header_helper(FrameType::PING, 8, Flags::ACK, 0),
-            std::move(data));
+            payload_variant(std::move(data)));
         // do_send();
         return ErrorCodes::NO_ERROR;
     }
@@ -1277,7 +1218,7 @@ struct operation : net::detail::enable_weak_from_this<
             if (auto ite = __M_strms.find(strm_id); ite != __M_strms.end()) {
                 std::vector<unsigned char> payload(4);
                 to_network4(static_cast<std::uint32_t>(ec), payload.data());
-                pending_frames_emplace_back(
+                pending_frames.emplace_back(
                     create_frame_header_helper(FrameType::RST_STREAM, 4, 0,
                                                strm_id),
                     std::move(payload));
@@ -1287,56 +1228,28 @@ struct operation : net::detail::enable_weak_from_this<
         return ErrorCodes::NO_ERROR;
     }
 
-    template <typename... Ts>
-    void create_GOAWAY_frame(ErrorCodes e, Ts&&... additional_data) {
+    void create_GOAWAY_frame(ErrorCodes e) {
         if (!io_cntl.goaway_sent()) {
             shutdown_recv();
             io_cntl.send_goaway();
             client_max_id = -1;
             __M_strms.clear();
-            if constexpr (sizeof...(Ts) != 0) {
-                struct goaway_impl {
-                    using value_type = unsigned char;
-                    // last stream id eq 2^31-1: chxhttp won't send any data if
-                    // client is misbehaving.
-                    std::uint32_t stream_id = 0, error_code = 0;
-
-                    const unsigned char* data() const noexcept(true) {
-                        return (const unsigned char*)this;
-                    }
-                    constexpr std::size_t size() const noexcept(true) {
-                        return 8;
-                    }
-                } st;
-                static_assert(sizeof(goaway_impl) == 8);
-                st.stream_id = htonl(largest_strm_id_processed);
-                st.error_code = htonl(e);
-
-                std::size_t frame_length =
-                    8 + (... + net::buffer(additional_data).size());
-                assert(frame_length <= conn_settings.max_frame_size);
-
-                pending_frames_emplace_back(
-                    create_frame_header_helper(FrameType::GOAWAY, frame_length,
-                                               0, 0),
-                    payload_store::create(
-                        st, std::forward<Ts>(additional_data)...));
-            } else {
-                std::array<unsigned char, 8> payload;
-                to_network4(largest_strm_id_processed, payload.data());
-                to_network4(static_cast<std::uint32_t>(e), payload.data() + 4);
-                pending_frames_emplace_back(
-                    create_frame_header_helper(FrameType::GOAWAY, 8, 0, 0),
-                    std::move(payload));
-            }
+            std::array<unsigned char, 8> payload;
+            to_network4(largest_strm_id_processed, payload.data());
+            to_network4(static_cast<std::uint32_t>(e), payload.data() + 4);
+            pending_frames.emplace_back(
+                create_frame_header_helper(FrameType::GOAWAY, 8, 0, 0),
+                payload_variant(std::move(payload)));
             do_send();
         }
     }
 
     ErrorCodes create_SETTINGS_ACK_frame() {
         if (!io_cntl.goaway_sent()) {
-            pending_frames_emplace_back(create_frame_header_helper(
-                FrameType::SETTINGS, 0, Flags::ACK, 0));
+            pending_frames.emplace_back(
+                create_frame_header_helper(FrameType::SETTINGS, 0, Flags::ACK,
+                                           0),
+                payload_variant{});
         }
         // do_send();
         return ErrorCodes::NO_ERROR;
@@ -1358,7 +1271,7 @@ struct operation : net::detail::enable_weak_from_this<
                 ptr = to_network2(k, ptr);
                 ptr = to_network4(v, ptr);
             }
-            pending_frames_emplace_back(
+            pending_frames.emplace_back(
                 create_frame_header_helper(FrameType::SETTINGS, payload.size(),
                                            0, 0),
                 std::move(payload));
@@ -1371,63 +1284,42 @@ struct operation : net::detail::enable_weak_from_this<
         return ErrorCodes::NO_ERROR;
     }
 
-    void create_DATA_flush2(h2_strm_iterator ite) {
+    void create_DATA_flush3(h2_strm_iterator ite) {
         if (!io_cntl.goaway_sent()) {
             stream_id_t strm_id = ite->first;
             h2_strm& strm = ite->second;
-            auto& tasks = strm.pending_DATA_tasks;
+            auto& q = strm.pending_DATA_tasks;
             for (int wnd = std::min(server_wnd, strm.server_wnd);
-                 !tasks.empty() && wnd > 0;) {
-                data_task_t& task = tasks.front();
-                // bytes could be sent of this task
-                std::size_t avail_sz =
-                    std::min(static_cast<std::size_t>(wnd), task.sz);
-                while (avail_sz) {
-                    const std::size_t len = std::min(
-                        avail_sz,
-                        static_cast<std::size_t>(conn_settings.max_frame_size));
-                    std::size_t cur_sz = 0;
-                    std::vector<net::iovec_buffer> iov =
-                        iovec_generator(task.iovec, len, &cur_sz);
-
-                    assert(cur_sz == len);
-                    assert(len <= wnd && len <= task.sz && len <= avail_sz);
-                    server_wnd -= len;
-                    strm.server_wnd -= len;
-                    wnd -= len;
-                    avail_sz -= len;
-                    task.sz -= len;
-
-                    if (task.sz) {
-                        // DATA task not completed
-                        pending_frames_emplace_back(
-                            create_frame_header_helper(FrameType::DATA, len, 0,
-                                                       strm_id),
-                            payload_rep{}, std::move(iov));
-                    } else {
-                        assert(avail_sz == 0);
-                        // DATA task completed
-                        pending_frames_emplace_back(
-                            create_frame_header_helper(
-                                FrameType::DATA, len,
-                                (task.flags & Flags::END_STREAM)
-                                    ? Flags::END_STREAM
-                                    : 0,
-                                strm_id),
-                            payload_rep{std::move(task.payload)},
-                            std::move(iov));
-                    }
-                }
-                if (task.sz == 0) {
-                    if (task.flags & Flags::END_STREAM) {
+                 !q.empty() && wnd > 0;) {
+                data_task_t& task = q.front();
+                const std::size_t consumed =
+                    std::min(static_cast<std::size_t>(wnd), task.size());
+                server_wnd -= consumed;
+                wnd -= consumed;
+                if (consumed == task.size()) {
+                    // send whole data task
+                    std::visit(
+                        [&](auto& a) {
+                            pending_frames.emplace_back(
+                                create_frame_header_helper(FrameType::DATA,
+                                                           consumed, task.flags,
+                                                           strm_id),
+                                payload_variant(std::move(a)));
+                        },
+                        task.carrier);
+                    const flags_t flags = task.flags;
+                    q.pop();
+                    if (flags & Flags::END_STREAM) {
                         assert(strm.state == StreamStates::HalfClosedRemote);
                         __M_strms.erase(ite);
                         break;
-                    } else {
-                        tasks.pop();
                     }
                 } else {
-                    assert(wnd == 0);
+                    // send prefix of data
+                    pending_frames.emplace_back(
+                        create_frame_header_helper(FrameType::DATA, consumed, 0,
+                                                   strm_id),
+                        payload_variant(task.remove_prefix(consumed)));
                 }
             }
             do_send();
@@ -1448,40 +1340,33 @@ struct operation : net::detail::enable_weak_from_this<
 
             // send frame
             if (payload.size() <= conn_settings.max_frame_size) {
-                pending_frames_emplace_back(
-                    create_frame_header_helper(
-                        FrameType::HEADERS, payload.size(),
-                        flags | Flags::END_HEADERS, strm.self_pos->first),
-                    std::move(payload));
+                const std::size_t n = payload.size();
+                pending_frames.emplace_back(
+                    create_frame_header_helper(FrameType::HEADERS, n,
+                                               flags | Flags::END_HEADERS,
+                                               strm.self_pos->first),
+                    payload_variant(std::move(payload)));
             } else {
-                auto store = payload_store::create(std::move(payload));
-                std::vector<net::iovec_buffer> iovec =
-                    http::detail::create_iovec_vector(store->data);
-                std::vector<net::iovec_buffer> section =
-                    iovec_generator(iovec, conn_settings.max_frame_size);
-                pending_frames_emplace_back(
-                    create_frame_header_helper(
-                        FrameType::HEADERS, conn_settings.max_frame_size,
-                        flags & (~Flags::END_HEADERS) & (~Flags::END_STREAM),
-                        strm_id),
-                    payload_rep{}, std::move(section));
-                assert(!iovec.empty());
-                while (!iovec.empty()) {
-                    std::size_t n = 0;
-                    section = iovec_generator(iovec,
-                                              conn_settings.max_frame_size, &n);
-                    pending_frames_emplace_back(
-                        create_frame_header_helper(FrameType::CONTINUATION, n,
-                                                   flags &
-                                                       (~Flags::END_HEADERS) &
-                                                       (~Flags::END_STREAM),
-                                                   strm_id),
-                        payload_rep{}, std::move(section));
-                }
+                const std::size_t total_n =
+                    (payload.size() + conn_settings.max_frame_size - 1) /
+                    conn_settings.max_frame_size;
+
+                const std::size_t head = pending_frames.size();
+                pending_frames.resize(pending_frames.size() + total_n);
+
                 std::get<0>(pending_frames.back())[4] =
                     flags | Flags::END_HEADERS;
-                std::get<0>(std::get<0>(std::get<1>(pending_frames.back())))
-                    .payload = std::move(store);
+                auto& last =
+                    std::get<1>(pending_frames.back())
+                        .template emplace<__Payload_OffsetCarrierVector>(
+                            net::offset_carrier(std::move(payload), 0));
+                for (std::size_t i = 0; i + 1 < total_n; ++i) {
+                    net::const_buffer b(last.data(),
+                                        conn_settings.max_frame_size);
+                    last.remove_prefix(conn_settings.max_frame_size);
+                    std::get<1>(pending_frames[i + head])
+                        .template emplace<__Payload_ConstBuffer>(b);
+                }
             }
             if (flags & Flags::END_STREAM) {
                 send_ES_lifecycle(strm.self_pos);
@@ -1490,28 +1375,57 @@ struct operation : net::detail::enable_weak_from_this<
         return ErrorCodes::NO_ERROR;
     }
 
-    template <typename... Ts>
-    void create_DATA_frame(flags_t flags, h2_strm& strm, Ts&&... ts) {
+    template <typename T>
+    void create_DATA_frame(flags_t flags, h2_strm& strm, T&& t) {
         if (!io_cntl.goaway_sent()) {
             assert(strm.state == StreamStates::Open ||
                    strm.state == StreamStates::HalfClosedRemote);
-            std::size_t total_size = 0;
-            if constexpr (sizeof...(Ts)) {
-                total_size = (... + net::buffer(ts).size());
-            }
-
-            if (total_size) {
+            const std::size_t sz = net::buffer(t).size();
+            if (sz) {
                 strm.pending_DATA_tasks.push(
-                    data_task_t::create(flags, std::forward<Ts>(ts)...));
-                create_DATA_flush2(strm.self_pos);
+                    data_task_t::create(flags, std::forward<T>(t)));
+                create_DATA_flush3(strm.self_pos);
             } else {
-                pending_frames_emplace_back(create_frame_header_helper(
-                    FrameType::DATA, 0, flags, strm.self_pos->first));
+                pending_frames.emplace_back(
+                    create_frame_header_helper(FrameType::DATA, 0, flags,
+                                               strm.self_pos->first),
+                    payload_variant{});
                 if (flags & Flags::END_STREAM) {
                     send_ES_lifecycle(strm.self_pos);
                 }
             }
         }
+    }
+
+    ErrorCodes create_WINDOW_UPDATE_frame_stream(h2_strm& strm,
+                                                 std::int32_t inc) {
+        if (!io_cntl.goaway_sent()) {
+            if (inc <= 0) {
+                return ErrorCodes::INTERNAL_ERROR;
+            }
+            std::array<unsigned char, 4> payload;
+            to_network4(inc, payload.data());
+            pending_frames.emplace_back(
+                create_frame_header_helper(FrameType::WINDOW_UPDATE, 4, 0,
+                                           strm.self_pos->first),
+                payload_variant(payload));
+            strm.client_wnd += inc;
+        }
+        return ErrorCodes::NO_ERROR;
+    }
+    ErrorCodes create_WINDOW_UPDATE_frame_conn(std::int32_t inc) {
+        if (!io_cntl.goaway_sent()) {
+            if (inc <= 0) {
+                return ErrorCodes::INTERNAL_ERROR;
+            }
+            std::array<unsigned char, 4> payload;
+            to_network4(inc, payload.data());
+            pending_frames.emplace_back(
+                create_frame_header_helper(FrameType::WINDOW_UPDATE, 4, 0, 0),
+                payload_variant(payload));
+            client_wnd += inc;
+        }
+        return ErrorCodes::NO_ERROR;
     }
 
     void terminate_now() {

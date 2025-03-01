@@ -3,13 +3,13 @@
 #include "./request.hpp"
 #include "./status_code.hpp"
 #include "./events.hpp"
-#include "./detail/payload.hpp"
 #include "./session_closed.hpp"
 #include "./response.hpp"
 #include "./options.hpp"
 
 #include <chx/log.hpp>
 #include <chx/net.hpp>
+#include <chx/net/detail/accumulate_size.hpp>
 
 namespace chx::http::detail {
 template <typename Event, typename T, typename... Args>
@@ -98,8 +98,9 @@ struct operation
                 update_keepalive_timeout(__M_options->keepalive_timeout);
                 __M_inbuf_begin = __M_inbuf.data();
                 __M_inbuf_sz = s;
-                feed2(__M_inbuf_begin, __M_inbuf_sz);
-            } else if (e == net::errc::eof || e == net::errc::io_error) {
+                do_feed();
+            } else if (e == net::additional_errc::eof ||
+                       e == net::errc::io_error) {
                 shutdown_recv();
             } else {
                 // network failure
@@ -183,23 +184,31 @@ struct operation
     }
 
     using response_variant_t = std::variant<
-        std::tuple<std::string>,  // header-only
-        std::tuple<std::string, detail::payload_storage_wrapper,
-                   std::vector<struct net::iovec_buffer>>,  // with payload
+        std::string, std::tuple<std::string, net::const_buffer>,
+        std::tuple<std::string, std::string>,
         std::tuple<std::string, std::vector<unsigned char>>,
-        std::tuple<std::string, std::vector<net::iovec_buffer>>,
-        std::tuple<std::string, std::string_view>, std::string_view,
-        std::tuple<std::string, net::vcarrier>>;
+        std::tuple<std::string, net::mapped_file>,
+        std::tuple<std::string, net::carrier<net::mapped_file>>,
+        std::tuple<std::string, net::vcarrier>,
+        std::tuple<std::string, std::vector<std::vector<unsigned char>>>,
+
+        std::vector<unsigned char>, std::string_view>;
     enum __Resp_Var : std::size_t {
         __Resp_HeaderOnly = 0,
-        __Resp_Norm = 1,
-        __Resp_Vector = 2,
-        __Resp_IovecVector = 3,
-        __Resp_StringView = 4,
-        __Resp_RawStringView = 5,
-        __Resp_VCarrier = 6
+        __Resp_ConstBuffer = 1,
+        __Resp_Str = 2,
+        __Resp_Vector = 3,
+        __Resp_MappedFile = 4,
+        __Resp_MappedFileCarrier = 5,
+        __Resp_VCarrier = 6,
+        __Resp_MultiVector = 7,
+
+        __Resp_StreamingString = 0,
+        __Resp_StreamingVector = 8,
+        __Resp_StreamingStringView = 9
     };
     std::vector<response_variant_t> __M_pending_response;
+
     struct cmp {
         constexpr bool
         operator()(const std::pair<std::size_t, response_variant_t>& a,
@@ -212,18 +221,63 @@ struct operation
                         std::vector<std::pair<std::size_t, response_variant_t>>,
                         cmp>
         __M_strms_queue;
-    std::size_t __M_next_in_stream_id = 0;
+    // std::size_t __M_next_in_stream_id = 0;
+    std::size_t __M_current_in_stream_id = 0;
     std::size_t __M_next_out_stream_id = 0;
 
     constexpr std::size_t flying_stream_n() noexcept(true) {
-        return __M_next_in_stream_id - __M_next_out_stream_id;
+        return __M_current_in_stream_id - __M_next_out_stream_id + 1;
+    }
+
+    std::size_t streaming_flush_header(status_code code, fields_type&& fields) {
+        fields.set_field("transfer-encoding", "chunked");
+        std::string r =
+            chx::log::format(CHXLOG_STR("HTTP/1.1 %u %s\r\n%s\r\n"),
+                             static_cast<unsigned short>(code),
+                             status_code_name(code), fields.to_string());
+        std::size_t s = r.size();
+        __M_pending_response.emplace_back(
+            std::in_place_index<__Resp_StreamingString>, std::move(r));
+        do_send();
+        do_feed();
+        return s;
+    }
+    std::size_t streaming_flush(std::vector<unsigned char>&& buffer) {
+        std::size_t s = buffer.size();
+        std::string prefix = chx::log::format(CHXLOG_STR("%:x:lu\r\n"), s);
+        __M_pending_response.emplace_back(
+            std::in_place_index<__Resp_StreamingString>, std::move(prefix));
+        __M_pending_response.emplace_back(
+            std::in_place_index<__Resp_StreamingVector>, std::move(buffer));
+        __M_pending_response.emplace_back(
+            std::in_place_index<__Resp_StreamingStringView>,
+            std::string_view{"\r\n"});
+        do_send();
+        do_feed();
+        return s;
+    }
+    void streaming_commit() {
+        __M_pending_response.emplace_back(
+            std::in_place_index<__Resp_StreamingStringView>,
+            std::string_view{"0\r\n\r\n"});
+        ++__M_next_out_stream_id;
+        while (!__M_strms_queue.empty() &&
+               __M_strms_queue.top().first == __M_next_out_stream_id) {
+            __M_pending_response.emplace_back(std::move(
+                const_cast<response_variant_t&>(__M_strms_queue.top().second)));
+            __M_strms_queue.pop();
+            ++__M_next_out_stream_id;
+        }
+        do_send();
+        do_feed();
     }
 
     template <std::size_t Idx, typename... Ts>
     void __response_emplace(std::size_t strm_id, status_code code,
                             const fields_type& fields, Ts&&... ts) {
-        assert(strm_id >= __M_next_out_stream_id &&
-               "stream id of response must >= __M_next_stream_id");
+        if (strm_id < __M_next_out_stream_id) {
+            return;
+        }
         if (strm_id == __M_next_out_stream_id) {
             __M_pending_response.emplace_back(
                 std::in_place_index_t<Idx>{},
@@ -250,62 +304,46 @@ struct operation
             ++__M_next_out_stream_id;
         }
         do_send();
-        do_read();
+        do_feed();
     }
 
-    template <typename... Ts>
     void __response(std::size_t strm_id, status_code code,
-                    const fields_type& fields, Ts&&... ts) {
-        if constexpr (sizeof...(Ts) > 1) {
-            return __response_multi(strm_id, code, fields,
-                                    std::forward<Ts>(ts)...);
-        } else if constexpr (sizeof...(Ts) == 1) {
-            return __response_single(strm_id, code, fields,
-                                     std::forward<Ts>(ts)...);
-        } else {
-            return __response0(strm_id, code, fields);
-        }
+                    const fields_type& fields) {
+        __response_emplace<__Resp_HeaderOnly>(strm_id, code, fields);
     }
-    void __response0(std::size_t strm_id, status_code code,
-                     const fields_type& fields) {
-        __response_emplace<0>(strm_id, code, fields);
+    void __response(std::size_t strm_id, status_code code,
+                    const fields_type& fields, net::const_buffer view) {
+        __response_emplace<__Resp_ConstBuffer>(strm_id, code, fields, view);
     }
-    template <typename... Ts>
-    void __response_multi(std::size_t strm_id, status_code code,
-                          const fields_type& fields, Ts&&... ts) {
-        std::unique_ptr store =
-            detail::payload_storage::create(std::forward<Ts>(ts)...);
-        std::vector<net::iovec_buffer> iov =
-            detail::create_iovec_vector(store->data);
-        __response_emplace<1>(strm_id, code, fields, std::move(store),
-                              std::move(iov));
+    void __response(std::size_t strm_id, status_code code,
+                    const fields_type& fields, std::string&& str) {
+        __response_emplace<__Resp_Str>(strm_id, code, fields, std::move(str));
     }
-    template <typename T>
-    void __response_single(std::size_t strm_id, status_code code,
-                           const fields_type& fields, T&& t) {
-        if constexpr (std::is_lvalue_reference_v<T> &&
-                      !std::is_same_v<std::decay_t<T>, std::string_view>) {
-            return __response_multi(strm_id, code, fields, std::forward<T>(t));
-        } else {
-            using __dct = std::decay_t<T>;
-            if constexpr (std::is_same_v<__dct, std::vector<unsigned char>>) {
-                __response_emplace<__Resp_Vector>(strm_id, code, fields,
-                                                  std::move(t));
-            } else if constexpr (std::is_same_v<__dct, std::string_view>) {
-                __response_emplace<__Resp_StringView>(strm_id, code, fields, t);
-            } else if constexpr (std::is_same_v<
-                                     __dct, std::vector<net::iovec_buffer>>) {
-                __response_emplace<__Resp_IovecVector>(strm_id, code, fields,
-                                                       std::move(t));
-            } else if constexpr (std::is_same_v<__dct, net::vcarrier>) {
-                __response_emplace<__Resp_VCarrier>(strm_id, code, fields,
-                                                    std::move(t));
-            } else {
-                return __response_single(
-                    strm_id, code, fields,
-                    net::vcarrier::create(std::forward<T>(t)));
-            }
-        }
+    void __response(std::size_t strm_id, status_code code,
+                    const fields_type& fields, std::vector<unsigned char>&& d) {
+        __response_emplace<__Resp_Vector>(strm_id, code, fields, std::move(d));
+    }
+    void __response(std::size_t strm_id, status_code code,
+                    const fields_type& fields, net::mapped_file&& f) {
+        __response_emplace<__Resp_MappedFile>(strm_id, code, fields,
+                                              std::move(f));
+    }
+    void __response(std::size_t strm_id, status_code code,
+                    const fields_type& fields,
+                    net::carrier<net::mapped_file>&& f) {
+        __response_emplace<__Resp_MappedFileCarrier>(strm_id, code, fields,
+                                                     std::move(f));
+    }
+    void __response(std::size_t strm_id, status_code code,
+                    const fields_type& fields, net::vcarrier&& v) {
+        __response_emplace<__Resp_VCarrier>(strm_id, code, fields,
+                                            std::move(v));
+    }
+    void __response(std::size_t strm_id, status_code code,
+                    const fields_type& fields,
+                    std::vector<std::vector<unsigned char>>&& v) {
+        __response_emplace<__Resp_MultiVector>(strm_id, code, fields,
+                                               std::move(v));
     }
 
   public:
@@ -325,7 +363,7 @@ struct operation
             // content length
             std::size_t content_length = 0;
             if constexpr (sizeof...(Ts)) {
-                content_length = (... + net::buffer(ts).size());
+                content_length = net::detail::accumulate_size(ts...);
             }
             fields.set_field("Content-Length",
                              log::format(CHXLOG_STR("%lu"), content_length));
@@ -348,7 +386,6 @@ struct operation
 
     void terminate_now() {
         shutdown_both();
-        // io_cntl.send_goaway();
         cancel_all();
     }
 
@@ -365,7 +402,7 @@ struct operation
                 return HPE_OK;
             } else {
                 self->encountered_error(http::status_code::URI_Too_Long,
-                                        self->__M_next_in_stream_id - 1);
+                                        self->__M_current_in_stream_id);
                 return -1;
             }
         }
@@ -375,7 +412,7 @@ struct operation
                 operation* self = static_cast<operation*>(c->data);
                 on<data_block>(
                     self->session(), self->__M_current_request,
-                    response_impl(self, self->__M_next_in_stream_id - 1),
+                    response_impl(self, self->__M_current_in_stream_id),
                     (const unsigned char*)p, (const unsigned char*)p + s);
                 return self->io_cntl.want_recv() ? HPE_OK : HPE_PAUSED;
             };
@@ -413,7 +450,6 @@ struct operation
 
             s.on_message_begin = [](llhttp_t* c) -> int {
                 operation* self = static_cast<operation*>(c->data);
-                ++self->__M_next_in_stream_id;
                 self->__M_parse_state = {};
                 self->__M_current_request = {};
                 on<message_start>(self->session(), *self);
@@ -424,7 +460,7 @@ struct operation
                 self->__M_parse_state.current_size = 0;
                 on<header_complete>(
                     self->session(), self->__M_current_request,
-                    response_impl(self, self->__M_next_in_stream_id - 1));
+                    response_impl(self, self->__M_current_in_stream_id));
                 return !self->should_pause() && self->io_cntl.want_recv()
                            ? HPE_OK
                            : HPE_PAUSED;
@@ -434,14 +470,14 @@ struct operation
                 self->__M_parse_state.current_size = 0;
                 if (!llhttp_should_keep_alive(c)) {
                     self->shutdown_recv();
-                } else if (self->__M_next_in_stream_id >
+                } else if (self->__M_current_in_stream_id >=
                            self->__M_options->max_stream_id) {
                     self->shutdown_recv();
                 }
                 self->update_keepalive_timeout(std::chrono::seconds(0));
                 on<message_complete>(
                     self->session(), self->__M_current_request,
-                    response_impl(self, self->__M_next_in_stream_id - 1));
+                    response_impl(self, self->__M_current_in_stream_id++));
                 return (self->flying_stream_n() <
                             self->__M_options->max_concurrent_stream &&
                         self->io_cntl.want_recv())
@@ -527,16 +563,21 @@ struct operation
         io_cntl.shutdown_both();
     }
 
+    void do_feed() {
+        if (!should_pause() && io_cntl.want_recv() && !io_cntl.is_recving() &&
+            flying_stream_n() <= __M_options->max_concurrent_stream) {
+            __feed(__M_inbuf_begin, __M_inbuf_sz);
+        }
+    }
+
     void do_read() {
-        if (!should_pause() && io_cntl.want_recv() && !io_cntl.is_recving()) {
-            if (__M_inbuf_sz == 0) {
-                io_cntl.set_recving();
-                stream().lowest_layer().async_read_some(
-                    net::buffer(__M_inbuf),
-                    cntl().template next_with_tag<internal_read>());
-            } else {
-                feed2(__M_inbuf_begin, __M_inbuf_sz);
-            }
+        if (!should_pause() && io_cntl.want_recv() && !io_cntl.is_recving() &&
+            flying_stream_n() <= __M_options->max_concurrent_stream) {
+            assert(__M_inbuf_sz == 0);
+            io_cntl.set_recving();
+            stream().lowest_layer().async_read_some(
+                net::buffer(__M_inbuf),
+                cntl().template next_with_tag<internal_read>());
         }
     }
 
@@ -561,11 +602,8 @@ struct operation
     // 24.08.23 i think it would be better for os to manage pipelining message,
     // not chxhttp :), so do_read() and do_send() should be called by response.
     // but pending_response is still useful.
-    void feed2(const char* ptr, std::size_t len) {
-        if (!should_pause() &&
-            flying_stream_n() < __M_options->max_concurrent_stream &&
-            io_cntl.want_recv() && !io_cntl.is_recving() &&
-            !io_cntl.is_feeding()) {
+    void __feed(const char* ptr, std::size_t len) {
+        if (!io_cntl.is_feeding()) {
             struct guard_t {
                 constexpr guard_t(operation* o) : oper(o) {
                     oper->io_cntl.set_feeding();
@@ -595,13 +633,13 @@ struct operation
                 return;
             default: {
                 encountered_error(status_code::Bad_Request,
-                                  __M_next_in_stream_id - 1);
+                                  __M_current_in_stream_id);
             }
             }
         }
     }
 
-    class response_impl : public response {
+    class response_impl : public response_type {
         friend operation;
 
       public:
@@ -610,43 +648,50 @@ struct operation
 
         virtual ~response_impl() = default;
 
-        virtual std::unique_ptr<response> make_unique() const override {
+      private:
+        virtual std::unique_ptr<response_type> make_unique() const override {
             return std::make_unique<response_impl>(*this);
         }
-        virtual std::shared_ptr<response> make_shared() const override {
+        virtual std::shared_ptr<response_type> make_shared() const override {
             return std::make_shared<response_impl>(*this);
         }
 
         virtual bool get_guard() const noexcept(true) override {
-            return self && self->get_guard();
+            return self && self->get_guard() &&
+                   !(self->__M_current_in_stream_id == strm_id);
         }
 
         virtual void do_end(status_code code, fields_type&& fields) override {
-            __response(code, std::move(fields));
+            do_response(code, std::move(fields));
         }
         virtual void do_end(status_code code, fields_type&& fields,
-                            std::string_view payload) override {
-            __response(code, std::move(fields), std::move(payload));
+                            net::const_buffer buffer) override {
+            do_response(code, std::move(fields), std::move(buffer));
         }
         virtual void do_end(status_code code, fields_type&& fields,
                             std::string payload) override {
-            __response(code, std::move(fields), std::move(payload));
+            do_response(code, std::move(fields), std::move(payload));
         }
         virtual void do_end(status_code code, fields_type&& fields,
                             std::vector<unsigned char> payload) override {
-            __response(code, std::move(fields), std::move(payload));
+            do_response(code, std::move(fields), std::move(payload));
         }
         virtual void do_end(status_code code, fields_type&& fields,
                             net::mapped_file mapped) override {
-            __response(code, std::move(fields), std::move(mapped));
+            do_response(code, std::move(fields), std::move(mapped));
         }
         virtual void do_end(status_code code, fields_type&& fields,
                             net::carrier<net::mapped_file> mapped) override {
-            __response(code, std::move(fields), std::move(mapped));
+            do_response(code, std::move(fields), std::move(mapped));
         }
         virtual void do_end(status_code code, fields_type&& fields,
                             net::vcarrier&& vcarrier) override {
-            __response(code, std::move(fields), std::move(vcarrier));
+            do_response(code, std::move(fields), std::move(vcarrier));
+        }
+        virtual void
+        do_end(status_code code, fields_type&& fields,
+               std::vector<std::vector<unsigned char>> b) override {
+            do_response(code, std::move(fields), std::move(b));
         }
 
         virtual const net::ip::tcp::socket* socket() const
@@ -654,20 +699,52 @@ struct operation
             return self ? &self->stream() : nullptr;
         }
 
-      private:
         virtual void do_terminate() override {
             if (self) {
                 self->terminate_now();
             }
         }
-        virtual void do_pause() override { ++self->__M_parse_state.pause_vote; }
+        virtual void do_pause() override {
+            if (self) {
+                self->update_keepalive_timeout(std::chrono::seconds(0));
+                ++self->__M_parse_state.pause_vote;
+            }
+        }
         virtual void do_resume() override {
-            assert(self->__M_parse_state.pause_vote);
-            --self->__M_parse_state.pause_vote;
+            if (self) {
+                assert(self->__M_parse_state.pause_vote);
+                --self->__M_parse_state.pause_vote;
+                self->update_keepalive_timeout(
+                    self->__M_options->keepalive_timeout);
+                self->do_feed();
+            }
+        }
+
+        virtual bool do_streaming_would_block() noexcept(true) override {
+            return get_guard() && self->__M_next_out_stream_id != strm_id;
+        }
+        virtual std::size_t
+        do_streaming_flush_header(status_code code,
+                                  fields_type&& fields) override {
+            assert(!do_streaming_would_block());
+            return self->streaming_flush_header(code, std::move(fields));
+        }
+        virtual std::size_t
+        do_streaming_flush(std::vector<unsigned char>&& buffer) override {
+            assert(!do_streaming_would_block());
+            return self->streaming_flush(std::move(buffer));
+        }
+        void do_streaming_commit() override {
+            assert(!do_streaming_would_block());
+            return self->streaming_commit();
         }
 
         virtual net::io_context& do_get_associated_io_context() const override {
             return self->cntl().get_associated_io_context();
+        }
+
+        virtual bool do_expired() const noexcept(true) override {
+            return !self;
         }
 
         constexpr response_impl(operation* s, std::size_t id) noexcept(true)
@@ -677,7 +754,7 @@ struct operation
         const std::size_t strm_id;
 
         template <typename... Ts>
-        void __response(status_code code, fields_type&& fields, Ts&&... ts) {
+        void do_response(status_code code, fields_type&& fields, Ts&&... ts) {
             if (get_guard()) {
                 self->response(strm_id, code, std::move(fields),
                                std::forward<Ts>(ts)...);

@@ -4,38 +4,62 @@
 #include "../response.hpp"
 #include "./controller_context_base.hpp"
 
+#include <chx/net/detail/tracker.hpp>
+#include <functional>
+
 namespace chx::http::web {
+struct header_complete_args {
+    response_type& resp;
+    controller_context ctx;
+};
+struct data_block_args {
+    response_type& resp;
+};
+
 class controller_base {
   public:
     virtual ~controller_base() = default;
 
-    virtual std::shared_ptr<controller_context_base>
-    on_header_complete(request_type& request, response& resp) {
-        return nullptr;
+    void
+    on_header_complete(request_type& request, response_type& resp,
+                       std::function<void(header_complete_args)>&& callback) {
+        return do_on_header_complete(request, resp, std::move(callback));
+    }
+
+    void on_data_block(controller_context& session, request_type& request,
+                       response_type& resp, const unsigned char* begin,
+                       const unsigned char* end,
+                       std::function<void(data_block_args)>&& callback) {
+        return do_on_data_block(session, request, resp, begin, end,
+                                std::move(callback));
+    }
+
+    void on_message_complete(controller_context& session, request_type& request,
+                             response_type&& response) {
+        return do_on_message_complete(session, request, std::move(response));
+    }
+
+    void on_destruct(controller_context& session) noexcept(true) {
+        return do_on_destruct(session);
+    }
+
+  private:
+    virtual void do_on_header_complete(
+        request_type& request, response_type& resp,
+        std::function<void(header_complete_args)>&& callback) {
+        callback({resp, nullptr});
     }
     virtual void
-    on_data_block(const std::shared_ptr<controller_context_base>& session,
-                  request_type& request, response& resp,
-                  const unsigned char* begin, const unsigned char* end) {}
-    virtual void
-    on_message_complete(const std::shared_ptr<controller_context_base>& session,
-                        request_type& request, response&& response) = 0;
+    do_on_data_block(controller_context& session, request_type& request,
+                     response_type& resp, const unsigned char* begin,
+                     const unsigned char* end,
+                     std::function<void(data_block_args)>&& callback) {
+        callback({resp});
+    }
+    virtual void do_on_message_complete(controller_context& session,
+                                        request_type& request,
+                                        response_type&& response) = 0;
+
+    virtual void do_on_destruct(controller_context& session) noexcept(true) {}
 };
-
-template <typename Fn>
-std::unique_ptr<controller_base> create_simple_controller(Fn&& fn) {
-    using base_fn = std::remove_reference_t<Fn>;
-    class __impl : protected base_fn, public controller_base {
-      public:
-        __impl(Fn&& fn) : base_fn(std::forward<Fn>(fn)) {}
-
-        void on_message_complete(controller_context_base* session,
-                                 request_type& request,
-                                 response&& response) override {
-            static_cast<Fn&&>(static_cast<base_fn&>(*this))(
-                request, std::move(response));
-        }
-    };
-    return std::make_unique<__impl>(std::forward<Fn>(fn));
-}
 }  // namespace chx::http::web
