@@ -3,7 +3,7 @@
 #include <llhttp.h>
 
 namespace chx::http {
-enum class method_type {
+enum method_type {
     BAD_METHOD = 0,
     GET = 1,
     HEAD = 2,

@@ -9,8 +9,7 @@
 #include <variant>
 
 namespace chx::http {
-
-class action_result {
+struct action_result {
     friend class response_type;
 
     using payload_type =
@@ -19,46 +18,32 @@ class action_result {
                      std::vector<std::vector<unsigned char>>, net::mapped_file,
                      net::carrier<net::mapped_file>, net::vcarrier>;
 
-  protected:
-    status_code __M_code = status_code::OK;
-    fields_type __M_fields;
-    payload_type __M_payload;
+    status_code code = status_code::OK;
+    fields_type fields;
+    payload_type payload;
 
-  public:
     action_result() = default;
 
     action_result(status_code code) : action_result(code, fields_type{}) {}
     action_result(status_code code, fields_type fields)
-        : __M_code(code), __M_fields(std::move(fields)) {}
+        : code(code), fields(std::move(fields)) {}
 
     template <typename T>
     action_result(status_code code, T t)
         : action_result(code, fields_type{}, std::move(t)) {}
     template <typename T>
     action_result(status_code code, fields_type fields, T t)
-        : __M_code(code), __M_fields(std::move(fields)),
-          __M_payload(std::move(t)) {}
+        : code(code), fields(std::move(fields)), payload(std::move(t)) {}
 
     template <typename CharT, typename Traits>
     action_result(status_code code, fields_type fields,
                   std::basic_string_view<CharT, Traits> t)
-        : __M_code(code), __M_fields(std::move(fields)),
-          __M_payload(net::buffer(t)) {}
+        : code(code), fields(std::move(fields)), payload(net::buffer(t)) {}
 
     template <typename CharT, std::size_t N,
               typename = std::void_t<std::enable_if_t<sizeof(CharT) == 1>>>
     action_result(status_code code, fields_type fields, CharT p[N])
         : action_result(code, std::move(fields), std::basic_string_view{p}) {}
-
-    constexpr status_code code() const noexcept(true) { return __M_code; }
-    constexpr fields_type& fields() noexcept(true) { return __M_fields; }
-    constexpr const fields_type& fields() const noexcept(true) {
-        return __M_fields;
-    }
-    constexpr payload_type& payload() noexcept(true) { return __M_payload; }
-    constexpr const payload_type& payload() const noexcept(true) {
-        return __M_payload;
-    }
 };
 
 class response_type {
@@ -183,13 +168,12 @@ class response_type {
                 if constexpr (std::is_same_v<
                                   std::decay_t<decltype(a)>,
                                   net::detail::monostate_container>) {
-                    end(result.__M_code, std::move(result.__M_fields));
+                    end(result.code, std::move(result.fields));
                 } else {
-                    end(result.__M_code, std::move(result.__M_fields),
-                        std::move(a));
+                    end(result.code, std::move(result.fields), std::move(a));
                 }
             },
-            result.payload());
+            result.payload);
     }
 
   private:

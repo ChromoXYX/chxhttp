@@ -3,7 +3,7 @@
 #include <chx/net/error_code.hpp>
 
 namespace chx::http {
-enum class status_code : unsigned short {
+enum status_code : unsigned short {
     Continue = 100,
     Switching_Protocols = 101,
     OK = 200,

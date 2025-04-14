@@ -740,6 +740,9 @@ struct operation
         }
 
         virtual net::io_context& do_get_associated_io_context() const override {
+            if (do_expired()) {
+                throw session_closed{};
+            }
             return self->cntl().get_associated_io_context();
         }
 

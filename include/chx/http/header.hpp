@@ -48,7 +48,7 @@ class fields_type {
         return __M_v.back();
     }
 
-    constexpr std::size_t byte_n() const noexcept(true) {
+    std::size_t byte_n() const noexcept(true) {
         std::size_t __r = 0;
         for (const auto& [k, v] : *this) {
             if (!k.empty() && !v.empty()) {
