@@ -29,3 +29,7 @@ make
 ## Configuration
 
 chxhttp uses json for configuration. Refer to config.json and conf.d/test.json for exmaples.
+
+## ToDo & Next
+
+deprecate session_factory and rewrite as sender/receiver.
