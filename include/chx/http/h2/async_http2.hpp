@@ -41,11 +41,11 @@ struct operation : net::detail::enable_weak_from_this<
   private:
     template <typename Event, typename T, typename... Args>
     ErrorCodes on(T&& t, Args&&... args) {
+        ErrorCodes r = ErrorCodes::NO_ERROR;
         if constexpr (std::is_invocable_v<T&&, Event, Args&&...>) {
-            return std::forward<T>(t)(Event(), std::forward<Args>(args)...);
-        } else {
-            return ErrorCodes::NO_ERROR;
+            r = std::forward<T>(t)(Event(), std::forward<Args>(args)...);
         }
+        return r;
     }
 
     using cntl_type = CntlType;
@@ -446,6 +446,16 @@ struct operation : net::detail::enable_weak_from_this<
     ErrorCodes reset_fsm() {
         ErrorCodes r = on<ev::frame_complete>(__M_session, *this,
                                               current_frame.const_self());
+        if (current_frame.strm &&
+            current_frame.strm->state == StreamStates::Closed) {
+            const frame_type_t type = current_frame.type;
+            const flags_t flags = current_frame.flags;
+            if ((type != FrameType::HEADERS &&
+                 type != FrameType::CONTINUATION) ||
+                flags & Flags::END_HEADERS) {
+                __M_strms.erase(current_frame.strm->self_pos);
+            }
+        }
         current_frame = {};
         __M_state.template emplace<LengthStage>();
         return r;
@@ -457,6 +467,7 @@ struct operation : net::detail::enable_weak_from_this<
     std::int32_t client_wnd = 65535;
     std::int32_t server_wnd = 65535;
 
+    // check header, and perform lifecycle transition
     ErrorCodes frame_dispatch() {
         if (current_frame.stream_id &&
             current_frame.stream_id >
@@ -476,7 +487,7 @@ struct operation : net::detail::enable_weak_from_this<
         case DATA: {
             /*
             DATA frame requirements:
-            0. state==Open✅
+            0. state==Open || state==HalfClosedLocal✅
             1. if PADDED, then length must ge 1.✅
             2. when PADDED length read, length must ge 1 + PADDED
             3. length le client wnd and stream client wnd✅
@@ -490,7 +501,8 @@ struct operation : net::detail::enable_weak_from_this<
                 return ErrorCodes::PROTOCOL_ERROR;
             }
             h2_strm& strm = ite->second;
-            if (strm.state != StreamStates::Open) {
+            if (strm.state != StreamStates::Open &&
+                strm.state != StreamStates::HalfClosedLocal) {
                 return ErrorCodes::PROTOCOL_ERROR;
             }
             if (current_frame.length > client_wnd ||
@@ -507,6 +519,11 @@ struct operation : net::detail::enable_weak_from_this<
 
             if (current_frame.flags & Flags::END_STREAM) {
                 strm.state = StreamStates::HalfClosedRemote;
+                if (strm.state == StreamStates::Open) {
+                    strm.state = StreamStates::HalfClosedRemote;
+                } else /* strm.state eq HalfClosedLocal */ {
+                    strm.state = StreamStates::Closed;
+                }
             }
             current_frame.strm = strm.weak_from_this();
             break;
@@ -515,7 +532,7 @@ struct operation : net::detail::enable_weak_from_this<
             /*
             HEADERS requirements:
             0. length must ge offset.✅
-            1. state==Open.✅
+            1. state==Open || state==HalfClosedLocal.✅
             */
             const std::size_t offset =
                 ((current_frame.flags & Flags::PADDED) ? 1 : 0) +
@@ -538,7 +555,8 @@ struct operation : net::detail::enable_weak_from_this<
                 ite->second.server_wnd = conn_settings.initial_window_size;
             }
             h2_strm& strm = ite->second;
-            if (strm.state != StreamStates::Open) {
+            if (strm.state != StreamStates::Open &&
+                strm.state != StreamStates::HalfClosedLocal) {
                 return ErrorCodes::PROTOCOL_ERROR;
             }
             if (current_frame.flags & Flags::PADDED) {
@@ -556,7 +574,11 @@ struct operation : net::detail::enable_weak_from_this<
             }
 
             if (current_frame.flags & Flags::END_STREAM) {
-                strm.state = StreamStates::HalfClosedRemote;
+                if (strm.state == StreamStates::Open) {
+                    strm.state = StreamStates::HalfClosedRemote;
+                } else {
+                    strm.state = StreamStates::Closed;
+                }
             }
             current_frame.strm = strm.weak_from_this();
             break;

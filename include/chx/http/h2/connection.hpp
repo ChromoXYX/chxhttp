@@ -13,7 +13,12 @@
 
 namespace chx::http::h2 {
 template <typename SessionFactory> class connection : private SessionFactory {
-    enum HttpStage { HeaderStage, DataStage, CompleteStage };
+    enum HttpStage {
+        HeaderStage,           // HEADER only
+        DataStage,             // DATA or trailing header
+        PendingCompleteStage,  // for pause/resume
+        PostCompleteStage
+    };
     template <typename Session> struct session_wrapper : Session {
         HttpStage stage = HeaderStage;
         request_type request;
@@ -37,14 +42,6 @@ template <typename SessionFactory> class connection : private SessionFactory {
     connection(SessionFactory&& session_factory)
         : SessionFactory(std::move(session_factory)) {}
 
-    /*
-    only END_HEADERS (header_complete) can switch stage to DataStage
-    only recv HEADERS frame at HeaderStage
-    only recv DATA frame at DataStage
-    only on_message_complete when at DataStage and
-    strm.state==HalfClosedRemote
-    */
-
     template <typename Cntl>
     ErrorCodes operator()(ev::frame_start, Cntl& cntl, const frame& frame) {
         if (!frame.strm) {
@@ -54,16 +51,21 @@ template <typename SessionFactory> class connection : private SessionFactory {
             return frame.strm->session().stage == DataStage
                        ? ErrorCodes::NO_ERROR
                        : ErrorCodes::PROTOCOL_ERROR;
-        } else if (frame.type == FrameType::HEADERS ||
-                   frame.type == FrameType::CONTINUATION) {
-            return frame.strm->session().stage == HeaderStage
-                       ? ErrorCodes::NO_ERROR
-                       : ErrorCodes::PROTOCOL_ERROR;
-        } else {
-            return ErrorCodes::NO_ERROR;
+        } else if (frame.type == FrameType::HEADERS) {
+            switch (frame.strm->session().stage) {
+            case HeaderStage:
+                return ErrorCodes::NO_ERROR;
+            case DataStage:
+                return (frame.flags & detail::Flags::END_STREAM)
+                           ? ErrorCodes::NO_ERROR
+                           : ErrorCodes::PROTOCOL_ERROR;
+            }
         }
+        return ErrorCodes::NO_ERROR;
     }
 
+    // since DATA frame comes with multi data_block, call ev::message_complete
+    // here.
     template <typename Oper>
     ErrorCodes operator()(ev::frame_complete, Oper& oper, const frame& frame) {
         if (!frame.strm) {
@@ -72,37 +74,18 @@ template <typename SessionFactory> class connection : private SessionFactory {
         if (frame.type == FrameType::DATA) {
             h2_stream& strm = *frame.strm;
             session_type& ses = strm.session();
-            if (strm.state == StreamStates::HalfClosedRemote) {
-                assert(ses.stage == DataStage);
-                if (!ses.pause_vote) {
-                    on<ev::message_complete>(ses, ses.request,
-                                             response_impl(&oper, frame.strm));
-                } else {
-                    ses.stage = CompleteStage;
-                }
+            if (strm.state == StreamStates::HalfClosedRemote ||
+                strm.state == StreamStates::Closed) {
+                do_finish(oper, frame);
             }
-            return ErrorCodes::NO_ERROR;
-        } else if (frame.type == FrameType::HEADERS ||
-                   frame.type == FrameType::CONTINUATION) {
-            h2_stream& strm = *frame.strm;
-            session_type& ses = strm.session();
-            if (ses.stage == DataStage  // all headers complete
-                &&
-                strm.state == StreamStates::HalfClosedRemote  // and END_STREAM
-            ) {
-                if (!ses.pause_vote) {
-                    on<ev::message_complete>(ses, ses.request,
-                                             response_impl(&oper, frame.strm));
-                } else {
-                    ses.stage = CompleteStage;
-                }
-            }
-            return ErrorCodes::NO_ERROR;
-        } else {
             return ErrorCodes::NO_ERROR;
         }
+        return ErrorCodes::NO_ERROR;
     }
 
+    // since it's unwise to classify HEADER against CONTINUATION, and
+    // header_complete can only be called when a header completed, call
+    // ev::message_complete here.
     template <typename Oper>
     ErrorCodes operator()(ev::header_complete, Oper& oper, const frame& frame,
                           fields_type&& fields) {
@@ -110,38 +93,56 @@ template <typename SessionFactory> class connection : private SessionFactory {
             return ErrorCodes::NO_ERROR;
         }
         session_type& ses = frame.strm->session();
-        ses.stage = DataStage;
-
         request_type& req = ses.request;
-        if (auto ite = fields.find(":path"); ite != fields.end()) {
-            req.request_target = ite->second;
-        } else {
-            return ErrorCodes::PROTOCOL_ERROR;
-        }
-        if (auto ite = fields.find(":method"); ite != fields.end()) {
-            const std::string& m = ite->second;
-            if (m == "GET") {
-                req.method = method_type::GET;
-            } else if (m == "HEAD") {
-                req.method = method_type::HEAD;
-            } else if (m == "POST") {
-                req.method = method_type::POST;
-            } else if (m == "PUT") {
-                req.method = method_type::PUT;
-            } else if (m == "DELETE") {
-                req.method = method_type::DELETE;
-            } else if (m == "OPTIONS") {
-                req.method = method_type::OPTIONS;
-            } else if (m == "TRACE") {
-                req.method = method_type::TRACE;
+
+        if (ses.stage == HeaderStage) {
+            ses.stage = DataStage;
+
+            if (auto ite = fields.find(":path"); ite != fields.end()) {
+                req.request_target = ite->second;
             } else {
                 return ErrorCodes::PROTOCOL_ERROR;
             }
+            if (auto ite = fields.find(":method"); ite != fields.end()) {
+                const std::string& m = ite->second;
+                if (m == "GET") {
+                    req.method = method_type::GET;
+                } else if (m == "HEAD") {
+                    req.method = method_type::HEAD;
+                } else if (m == "POST") {
+                    req.method = method_type::POST;
+                } else if (m == "PUT") {
+                    req.method = method_type::PUT;
+                } else if (m == "DELETE") {
+                    req.method = method_type::DELETE;
+                } else if (m == "OPTIONS") {
+                    req.method = method_type::OPTIONS;
+                } else if (m == "TRACE") {
+                    req.method = method_type::TRACE;
+                } else {
+                    return ErrorCodes::PROTOCOL_ERROR;
+                }
+            } else {
+                return ErrorCodes::PROTOCOL_ERROR;
+            }
+            req.fields = std::move(fields);
+            on<ev::header_complete>(ses, req, response_impl(&oper, frame.strm));
+            if (frame.strm &&
+                (frame.strm->state == StreamStates::HalfClosedRemote ||
+                 frame.strm->state == StreamStates::Closed)) {
+                do_finish(oper, frame);
+            }
         } else {
-            return ErrorCodes::PROTOCOL_ERROR;
+            // Trailing Header
+            for (const auto& field : fields) {
+                const std::string& key = field.first;
+                if (!key.empty() && key[0] == ':') {
+                    return ErrorCodes::PROTOCOL_ERROR;
+                }
+            }
+            req.trailing_headers = std::move(fields);
+            do_finish(oper, frame);
         }
-        req.fields = std::move(fields);
-        on<ev::header_complete>(ses, req, response_impl(&oper, frame.strm));
         return ErrorCodes::NO_ERROR;
     }
 
@@ -171,6 +172,21 @@ template <typename SessionFactory> class connection : private SessionFactory {
     static void on(T&& t, Args&&... args) {
         if constexpr (std::is_invocable_v<T&&, Event, Args&&...>) {
             return std::forward<T>(t)(Event(), std::forward<Args>(args)...);
+        }
+    }
+
+    template <typename Oper> void do_finish(Oper& oper, const frame& frame) {
+        session_type& ses = frame.strm->session();
+        assert(ses.stage != PostCompleteStage &&
+               ses.stage != PendingCompleteStage);
+        if (!ses.pause_vote) {
+            on<ev::message_complete>(ses, ses.request,
+                                     response_impl(&oper, frame.strm));
+            if (frame.strm) {
+                ses.stage = PostCompleteStage;
+            }
+        } else {
+            ses.stage = PendingCompleteStage;
         }
     }
 
@@ -246,10 +262,15 @@ template <typename SessionFactory> class connection : private SessionFactory {
                            ErrorCodes::NO_ERROR);
                     oper->do_send();
                 }
-                if (strm && !strm->pause_vote && strm->stage == CompleteStage) {
+                if (strm && !strm->pause_vote &&
+                    strm->stage == PendingCompleteStage) {
                     session_type& ses = strm->session();
+                    assert(ses.stage != PostCompleteStage);
                     on<ev::message_complete>(ses, ses.request,
                                              response_impl(*this));
+                    if (strm) {
+                        ses.stage = PostCompleteStage;
+                    }
                 }
             }
         }

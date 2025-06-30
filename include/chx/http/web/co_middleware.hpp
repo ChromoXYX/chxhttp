@@ -160,15 +160,22 @@ struct control_g_env {
         return p.r.code >= 400 && p.r.code <= 499;
     }
 };
+/**
+ * @brief local environment for middleware chain
+ *
+ */
 struct control_l_env {
-    control_g_env& g;
-    std::coroutine_handle<> h;
-    control_l_env* const parent;
+    control_g_env& g;  ///< reference to global environment
+    std::coroutine_handle<>
+        h;  ///< resumer of this middleware chain, typically exec()
+    control_l_env* const parent;  ///< parent of this middleware chain
 
-    std::vector<std::pair<std::string, data_reference>> mdata;
+    std::vector<std::pair<std::string, data_reference>>
+        mdata;  ///< data of middlewares in the chain
 
-    std::vector<net::future_view<>> future_list;
-    std::vector<mw_info> mw;
+    std::vector<net::future_view<>>
+        future_list;  ///< handles to resume middlewares, typically schedule()
+    std::vector<mw_info> mw;  ///< futures and awaitables of middlewares
 };
 
 class controller : public controller_base, public middleware_chain {
@@ -377,11 +384,7 @@ inline net::future<> middleware_chain::exec(control_g_env& g,
         if (((!g.encountered_error() && !g.encountered_exception()) ||
              l.mw[i].self->accept_error()) &&
             !l.future_list[i].h.done()) {
-            auto old_parent =
-                std::exchange(l.future_list[i].h.promise().__M_parent,
-                              co_await net::this_coro);
             co_await l.future_list[i];
-            l.future_list[i].h.promise().__M_parent = old_parent;
             if (l.mw[i].a.__M_ex) {
                 g.ex = std::exchange(l.mw[i].a.__M_ex, {});
             }
