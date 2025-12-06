@@ -32,4 +32,6 @@ chxhttp uses json for configuration. Refer to config.json and conf.d/test.json f
 
 ## ToDo & Next
 
-deprecate session_factory and rewrite as sender/receiver.
+~~deprecate session_factory and rewrite as sender/receiver.~~
+
+add grpc support (perhaps with quic)

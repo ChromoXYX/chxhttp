@@ -14,19 +14,6 @@
 #include "./controller_context_base.hpp"
 
 namespace chx::http::web::middleware {
-class middleware_interrupted : public net::exception {
-  public:
-    using exception::exception;
-};
-class middleware_interrupted_4xx : public middleware_interrupted {
-  public:
-    using middleware_interrupted::middleware_interrupted;
-};
-class middleware_interrupted_5xx : public middleware_interrupted {
-  public:
-    using middleware_interrupted::middleware_interrupted;
-};
-
 namespace detail {
 template <typename T> struct is_shared_ptr : std::false_type {};
 template <typename T>
@@ -74,13 +61,6 @@ template <> struct safe_pointer<void> {
 };
 
 class middleware_base;
-
-struct middleware_error {
-    http::status_code code;
-    std::string error_msg;
-
-    std::exception_ptr ex;
-};
 
 struct mw_info {
     net::future<> future;
@@ -154,11 +134,6 @@ struct control_g_env {
     bool short_circuited = false;
 
     std::vector<unsigned char> body;
-
-    constexpr bool encountered_exception() const noexcept(true) { return !!ex; }
-    constexpr bool encountered_error() const noexcept(true) {
-        return p.r.code >= 400 && p.r.code <= 499;
-    }
 };
 /**
  * @brief local environment for middleware chain
@@ -317,21 +292,16 @@ class control : public control_base {
 };
 
 class middleware_base {
-    virtual bool do_accept_error() const noexcept(true) { return false; }
-    virtual bool do_accept_exception_interrupt() const noexcept(true) {
-        return false;
-    }
     virtual net::future<> do_invoke(const request_type& req,
                                     response_type& resp, control cntl) = 0;
+    virtual bool do_enable_exception_from_schedule() const { return false; }
 
   public:
     virtual ~middleware_base() = default;
 
-    bool accept_error() const noexcept(true) { return do_accept_error(); }
-    bool accept_exception_interrupt() const noexcept(true) {
-        return do_accept_exception_interrupt();
+    bool enable_exception_from_schedule() const {
+        return do_enable_exception_from_schedule();
     }
-
     net::future<> operator()(const request_type& req, response_type& resp,
                              control cntl) {
         return do_invoke(req, resp, cntl);
@@ -339,24 +309,20 @@ class middleware_base {
 };
 
 inline void control::awaitable_base::await_resume() {
-    if (!self.l_env.mw[self.index].self->accept_exception_interrupt()) {
-        return;
-    }
-    if (self.l_env.g.encountered_exception()) {
-        throw middleware_interrupted_5xx{};
-    }
-    if (self.l_env.g.encountered_error()) {
-        throw middleware_interrupted_4xx{};
+    if (self.l_env.g.ex) {
+        assert(
+            self.l_env.mw[self.index].self->enable_exception_from_schedule());
+        std::rethrow_exception(self.l_env.g.ex);
     }
 }
 
 template <typename Fn, typename>
-middleware_chain& middleware_chain::add(Fn&& fn, bool accept_error) {
+middleware_chain& middleware_chain::add(Fn&& fn, bool enable_exception) {
     class impl : std::decay_t<Fn>, public middleware_base {
-        const bool __accept_error;
+        const bool __enable_exception;
 
-        bool do_accept_error() const noexcept(true) override {
-            return __accept_error;
+        bool do_enable_exception_from_schedule() const override {
+            return __enable_exception;
         }
         net::future<> do_invoke(const request_type& req, response_type& resp,
                                 control cntl) override {
@@ -365,14 +331,15 @@ middleware_chain& middleware_chain::add(Fn&& fn, bool accept_error) {
 
       public:
         impl(Fn&& fn, bool a)
-            : std::decay_t<Fn>(std::forward<Fn>(fn)), __accept_error(a) {}
+            : std::decay_t<Fn>(std::forward<Fn>(fn)), __enable_exception(a) {}
     };
-    return add(std::make_shared<impl>(std::forward<Fn>(fn), accept_error));
+    return add(std::make_shared<impl>(std::forward<Fn>(fn), enable_exception));
 }
-template <auto Fn> middleware_chain& middleware_chain::add(bool accept_error) {
+template <auto Fn>
+middleware_chain& middleware_chain::add(bool enable_exception) {
     return add([](const request_type& req, response_type& resp,
                   control cntl) { return Fn(req, resp, std::move(cntl)); },
-               accept_error);
+               enable_exception);
 }
 
 inline net::future<> middleware_chain::exec(control_g_env& g,
@@ -381,9 +348,8 @@ inline net::future<> middleware_chain::exec(control_g_env& g,
     l.h = co_await net::this_coro;
     net::detail::scope_exit _g([&l, prev_coro]() { l.h = prev_coro; });
     for (std::size_t i = 0; i < chain.size(); ++i) {
-        if (((!g.encountered_error() && !g.encountered_exception()) ||
-             l.mw[i].self->accept_error()) &&
-            !l.future_list[i].h.done()) {
+        if (!l.future_list[i].h.done() &&
+            (!g.ex || l.mw[i].self->enable_exception_from_schedule())) {
             co_await l.future_list[i];
             if (l.mw[i].a.__M_ex) {
                 g.ex = std::exchange(l.mw[i].a.__M_ex, {});
